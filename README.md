@@ -197,6 +197,36 @@ The server works on its current directory by default, and every tool accepts a `
 | `mimry_feedback` | Record which files helped a task |
 | `mimry_list_adapters`, `mimry_digest`, `mimry_plan_*` | Adapters, canonical index digest, read-only plan trees |
 
+### OpenCode
+
+Install MIMRY for OpenCode with:
+
+```bash
+mimry install --platform opencode
+```
+
+This installs the MIMRY skill at `~/.config/opencode/skills/mimry/SKILL.md` and adds the local MCP server to `~/.config/opencode/opencode.json`.
+Check the result with:
+
+```bash
+mimry install --platform opencode --status
+```
+
+### Kilo Code
+
+Install the MIMRY skill for Kilo Code with:
+
+```bash
+mimry install --platform kilo
+```
+
+The command writes the skill to `~/.config/kilo/skills/mimry/SKILL.md`; it does not modify a Kilo MCP configuration.
+Check the skill installation with:
+
+```bash
+mimry install --platform kilo --status
+```
+
 ### Teach your agent to use it
 
 MIMRY can install a skill (instruction bundle) that teaches an agent the workflow above:
