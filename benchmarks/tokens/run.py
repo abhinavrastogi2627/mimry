@@ -161,8 +161,12 @@ def keyword_lines(repo: Path, rel: str, words: list[str]) -> tuple[int, list[int
         return 0, []
     pattern = [arg for word in words for arg in ("-e", word)]
     out = run(["git", "grep", "-n", "-i", "-I", "-F", *pattern, "--", rel], repo)
-    shown = [line for line in out.split("\n") if line][:GREP_OUTPUT_LINES]
-    return tokens("\n".join(shown)), [int(line.split(":", 2)[1]) for line in shown]
+    shown = out.splitlines()[:GREP_OUTPUT_LINES]
+    # Only "path:N:" lines are grep hits. A stray \r or form feed in a
+    # matched line leaves fragments with no prefix, which are skipped.
+    prefix = re.compile(re.escape(rel) + r":(\d+):")
+    anchors = [int(m.group(1)) for line in shown if (m := prefix.match(line))]
+    return tokens("\n".join(shown)), anchors
 
 
 def window_read(
