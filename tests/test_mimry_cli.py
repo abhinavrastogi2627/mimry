@@ -883,6 +883,44 @@ def test_status_find_symbol_related_context_loop(tmp_path):
     assert "## Suggested Verification" in text
 
 
+def test_find_defaults_to_subdirectory_and_can_search_everywhere(tmp_path):
+    repo = copy_fixture(tmp_path)
+    cache = tmp_path / "cache"
+    assert run_cli(repo, cache, "init", "--skip-graph").returncode == 0
+    assert run_cli(repo, cache, "index").returncode == 0
+    nested = repo / "src" / "auth"
+    scoped = run_cli_from_cwd(nested, cache, "find", "auth session", "--limit", "20")
+    assert scoped.returncode == 0, scoped.stderr
+    paths = _result_paths(scoped.stdout)
+    assert paths
+    assert all(path.startswith("src/auth/") for path in paths)
+    whole = run_cli_from_cwd(
+        nested, cache, "find", "auth session", "--everywhere", "--limit", "20"
+    )
+    root = run_cli(repo, cache, "find", "auth session", "--limit", "20")
+    assert whole.returncode == 0, whole.stderr
+    assert _result_paths(whole.stdout) == _result_paths(root.stdout)
+    assert any(not path.startswith("src/auth/") for path in _result_paths(whole.stdout))
+    explicit = run_cli_from_cwd(nested, cache, "find", "auth session", "--path-glob", "src/*.ts")
+    assert explicit.returncode == 0, explicit.stderr
+    assert _result_paths(explicit.stdout) == ["src/app.ts"]
+
+
+@pytest.mark.parametrize("directory", ["[auth]", " auth"])
+def test_find_treats_subdirectory_names_as_literal_paths(tmp_path, directory):
+    repo = copy_fixture(tmp_path)
+    shutil.copytree(repo / "src" / "auth", repo / directory)
+    cache = tmp_path / "cache"
+    assert run_cli(repo, cache, "init", "--skip-graph").returncode == 0
+    assert run_cli(repo, cache, "index").returncode == 0
+    result = run_cli_from_cwd(repo / directory, cache, "find", "auth session", "--limit", "20")
+    assert result.returncode == 0, result.stderr
+    # Check numbered rows directly: the parser splits on whitespace.
+    rows = [line for line in result.stdout.splitlines() if line.strip()[:1].isdigit()]
+    assert rows
+    assert all(directory + "/" in line for line in rows)
+
+
 def test_route_recommends_backend_for_fastapi_auth_not_tooly(tmp_path):
     repo = copy_fixture(tmp_path)
     cache = tmp_path / "cache"

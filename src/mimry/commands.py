@@ -51,6 +51,7 @@ from .paths import (
     mdir,
     now,
     output_dir,
+    pointer_file,
 )
 from .plan import (
     PlanStore,
@@ -1445,9 +1446,21 @@ def cmd_semantic(a):
         return 0
 
 
-@_index_reader
 def cmd_find(a):
-    root = Path(a.root).resolve()
+    start = Path(getattr(a, "find_directory", a.root)).resolve()
+    root = next(
+        (folder for folder in (start, *start.parents) if pointer_file(folder).is_file()),
+        start,
+    )
+    # Pin the owning generation, not an unindexed child directory.
+    # Keep the original scope when main retries after a schema rebuild.
+    a.find_directory = start
+    a.root = str(root)
+    with active_index_pointer(root):
+        return _find_in_directory(a, root, start)
+
+
+def _find_in_directory(a, root, start):
     ptr = require(root)
     idx = Path(ptr["indexPath"])
     semantic = getattr(a, "semantic", False)
@@ -1456,6 +1469,15 @@ def cmd_find(a):
     query = sanitize_query(a.query)
     languages = getattr(a, "language", [])
     path_globs = getattr(a, "path_glob", [])
+    if not path_globs and not getattr(a, "everywhere", False) and start != root:
+        relative = start.relative_to(root).as_posix()
+        # The directory is literal, not a user-supplied glob.
+        # Escape special characters before applying recursive scope.
+        literal = "".join(
+            "[[]" if char == "[" else f"[{char}]" if char in "*?" or char.isspace() else char
+            for char in relative
+        )
+        path_globs = [literal + "/**"]
     exclude_globs = getattr(a, "exclude_glob", [])
     offset = getattr(a, "offset", None)
     try:
