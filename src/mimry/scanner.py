@@ -486,6 +486,23 @@ def worktree_fingerprint(root: Path) -> str | None:
     return digest.hexdigest()
 
 
+def _linked_worktree(folder: Path) -> bool:
+    """A linked worktree has its own source tree, unlike a submodule."""
+    try:
+        if not (folder / ".git").is_file():
+            return False
+        data, _ = read_snapshot(folder / ".git", 4096, root=folder)
+        marker = data.decode("utf-8", errors="surrogateescape").strip()
+        if not marker.startswith("gitdir:"):
+            return False
+        gitdir = Path(marker.removeprefix("gitdir:").strip())
+        if not gitdir.is_absolute():
+            gitdir = folder / gitdir
+        return gitdir.parent.name == "worktrees" and (gitdir / "commondir").is_file()
+    except (OSError, ValueError):
+        return False
+
+
 def scan_stats(
     root, *, probe_open: bool = True, settings: IndexSettings | None = None
 ) -> list[tuple[str, Path, os.stat_result]]:
@@ -510,6 +527,11 @@ def scan_stats(
     # against its full relative path. followlinks=False matches rglob,
     # which never descended into symlinked dirs.
     for dirpath, dirnames, filenames in os.walk(root_str, followlinks=False):
+        # The explicit root may itself be a worktree. Only nested
+        # worktrees are separate checkouts, not part of this index.
+        if dirpath != root_str and _linked_worktree(Path(dirpath)):
+            dirnames[:] = []
+            continue
         rel_dir = dirpath[len(root_str) :].lstrip(os.sep).replace(os.sep, "/")
         prefix = f"{rel_dir}/" if rel_dir else ""
         dirnames[:] = [
