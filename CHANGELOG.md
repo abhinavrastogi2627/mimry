@@ -4,6 +4,8 @@ Notable user-facing changes are recorded here. MIMRY is pre-1.0; compatibility c
 
 ## Unreleased
 
+- Scope `mimry find` to the current directory inside an indexed repository. Use `--everywhere` or an explicit `--path-glob` to search outside that directory.
+
 ### Determinism
 
 - Add the narrow `mimry plan` recursive decomposer: deterministic leaf-only splits, canonical repo-local JSON storage, terminal/JSON/Markdown projections, structural validation, semantic SHA-256, deterministic inventory, and read-only MCP parity. It stores explicit tree structure only and does not execute, schedule, refine, or track work.
