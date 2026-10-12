@@ -161,7 +161,7 @@ def keyword_lines(repo: Path, rel: str, words: list[str]) -> tuple[int, list[int
         return 0, []
     pattern = [arg for word in words for arg in ("-e", word)]
     out = run(["git", "grep", "-n", "-i", "-I", "-F", *pattern, "--", rel], repo)
-    shown = out.splitlines()[:GREP_OUTPUT_LINES]
+    shown = [line for line in out.split("\n") if line][:GREP_OUTPUT_LINES]
     return tokens("\n".join(shown)), [int(line.split(":", 2)[1]) for line in shown]
 
 
