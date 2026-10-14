@@ -36,6 +36,14 @@ def file_pieces(data: bytes, symbols: list[dict]) -> list[list]:
     """
     lines = data.decode("utf-8", errors="ignore").splitlines()
     pieces = []
+    # Symbols that share their own line range (a minified bundle can
+    # put thousands on a single line) share one piece. Its body is the
+    # tokens of those lines, tokenized once. Doing it per symbol is
+    # quadratic on a long line and stores the same body each time. The
+    # key is the symbol's range before attached lines are taken in, so a
+    # class and its first method (which starts on the next line) keep
+    # separate pieces.
+    seen_ranges: set[tuple[int, int]] = set()
     for symbol in symbols:
         start, end = symbol.get("line_start"), symbol.get("line_end")
         if not isinstance(start, int) or not isinstance(end, int) or not 1 <= start <= end:
@@ -43,6 +51,9 @@ def file_pieces(data: bytes, symbols: list[dict]) -> list[list]:
         end = min(end, len(lines))
         if start > end:
             continue
+        if (start, end) in seen_ranges:
+            continue
+        seen_ranges.add((start, end))
         # Doc comments, decorators and attributes sit directly above a
         # symbol; a piece starts at the top of that attached block.
         top = start
