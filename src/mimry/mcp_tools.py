@@ -13,29 +13,21 @@ from typing import Any, Literal
 
 from mimry.adapters import list_adapters
 from mimry.cache_safety import IndexOutsideCacheError
-from mimry.commands import (
-    INDEX_REBUILT_NOTE,
-    _change_summary,
-    _write_context_pack,
-    calls_payload,
-    cmd_init,
-    cmd_preflight,
-    cmd_refresh,
-    path_payload,
-    rebuild_outdated_index,
-    refresh_if_stale,
-    require,
-    run_explain,
-    run_path,
-    run_why,
-    symbol_matches,
-)
 from mimry.core.artifacts import CALL_DIRECTIONS, graph_health
 from mimry.core.languages import language_counts
 from mimry.digest import canonical_digest
 from mimry.feedback import feedback_payload_from_args, record_feedback
 from mimry.freshness import index_freshness
 from mimry.indexer import write_index
+from mimry.lifecycle import (
+    INDEX_REBUILT_NOTE,
+    change_summary,
+    rebuild_outdated_index,
+    refresh_if_stale,
+    require,
+    run_init,
+    run_refresh,
+)
 from mimry.mcp_protocol import exit_message, exit_status, tool
 from mimry.paths import context_file, task_context_file
 from mimry.plan import (
@@ -46,6 +38,16 @@ from mimry.plan import (
     plan_digest,
     render_markdown,
     render_terminal,
+)
+from mimry.queries import (
+    calls_payload,
+    path_payload,
+    run_explain,
+    run_path,
+    run_preflight,
+    run_why,
+    symbol_matches,
+    write_context_pack,
 )
 from mimry.routing import route_payload, write_brief
 from mimry.search import find_rows
@@ -289,7 +291,7 @@ def _index_operation(*, exclusive: bool = False, refresh: bool = False):
                     result["set_up_worktree"] = True
                     result["reindexed"] = f"set up this worktree, indexed {stats['files']} files"
                 else:
-                    result["reindexed"] = _change_summary(stats)
+                    result["reindexed"] = change_summary(stats)
             return result
 
         return guarded
@@ -395,7 +397,7 @@ def mimry_init(
     """Initialize MIMRY metadata for a root."""
     root_path = _root(root)
     payload = _capture_command(
-        cmd_init, SimpleNamespace(root=str(root_path), root_type=root_type, skip_graph=skip_graph)
+        run_init, SimpleNamespace(root=str(root_path), root_type=root_type, skip_graph=skip_graph)
     )
     payload["status"] = _status_payload(root_path)
     return payload
@@ -406,7 +408,7 @@ def mimry_init(
 def mimry_refresh(root: str | None = None) -> dict[str, Any]:
     """Run MIMRY index, semantic index, then status."""
     root_path = _root(root)
-    payload = _capture_command(cmd_refresh, SimpleNamespace(root=str(root_path)))
+    payload = _capture_command(run_refresh, SimpleNamespace(root=str(root_path)))
     payload["status"] = _status_payload(root_path)
     return payload
 
@@ -420,7 +422,7 @@ def mimry_preflight(
     root_path = _root(root)
     query = sanitize_query(query)
     payload = _capture_command(
-        cmd_preflight,
+        run_preflight,
         SimpleNamespace(root=str(root_path), task=query, force_refresh=force_refresh),
     )
     status = _status_payload(root_path)
@@ -640,7 +642,7 @@ def mimry_context(query: str, root: str | None = None, semantic: bool = False) -
     root_path = _root(root)
     query = sanitize_query(query)
     ptr = require(root_path)
-    rows, pack_path = _write_context_pack(root_path, ptr, query, semantic=semantic)
+    rows, pack_path = write_context_pack(root_path, ptr, query, semantic=semantic)
     return sanitize_data(
         {
             "query": redact_sensitive_text(query),
