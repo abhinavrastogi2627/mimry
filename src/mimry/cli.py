@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import sys
 
+from mimry import configure_console
+
 
 def _positive_int(value: str) -> int:
     import argparse
@@ -551,16 +553,6 @@ def _cmd_mcp(a) -> int:
     return 0
 
 
-def _configure_console() -> None:
-    # Human output must not crash on strict Windows code pages.
-    # Structured artifacts keep their explicit UTF-8 writers and remain
-    # untouched.
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if callable(reconfigure):
-            reconfigure(errors="backslashreplace")
-
-
 def _hook_check_root(args) -> str | None:
     """Root if argv is exactly ``[--root R] hook-check``, else None."""
     rest = list(args)
@@ -579,6 +571,7 @@ def main(argv=None):
 
         from .hook import cmd_hook_check
 
+        configure_console()
         return cmd_hook_check(SimpleNamespace(root=hook_root))
     from pathlib import Path
 
@@ -595,7 +588,7 @@ def main(argv=None):
     )
     from .storage import RootIdentityError, copied_folder_lines
 
-    _configure_console()
+    configure_console()
     a = build_parser().parse_args(argv)
     from . import ui
 
