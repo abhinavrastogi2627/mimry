@@ -11,6 +11,7 @@ import mimry.search as search
 from mimry.indexer import write_index
 from mimry.mcp_tools import mimry_find
 from mimry.paths import idx_path
+from mimry.pieces import piece_file_ranking, piece_files
 from mimry.search import _path_glob_matches, _search_scope, find_rows
 from mimry.storage import load_pointer, save_pointer
 
@@ -396,6 +397,160 @@ def test_find_rows_rows_carry_parts_ending_in_final_score(tmp_path, monkeypatch)
     for row in rows:
         assert row["parts"]["final_score"] == row["score"]
         assert all(isinstance(value, int | float) for value in row["parts"].values())
+
+
+def test_piece_ranking_puts_the_matching_function_before_a_passing_mention(tmp_path, monkeypatch):
+    matching = "def parse_header_line(line):\n    tokens = line.split(':')\n    return tokens\n"
+    passing = "def render(page):\n    header = page\n    return page\n"
+    _repo, ptr = _indexed(
+        tmp_path,
+        monkeypatch,
+        {"src/parse_header.py": matching, "src/render.py": passing},
+    )
+    idx = Path(ptr["indexPath"])
+    query = "parse header line tokens"
+
+    ranking = piece_file_ranking(idx, query)
+    assert [entry["piece_pos"] for entry in ranking] == [1, 2]
+    assert [entry["path"] for entry in piece_files(idx, query)] == [
+        "src/parse_header.py",
+        "src/render.py",
+    ]
+
+
+def test_keyword_ranking_puts_the_rare_identifier_before_common_words(tmp_path, monkeypatch):
+    budget = "def compute_retry_budget(attempts):\n    return min(attempts, 3)\n"
+    common = (
+        "# the function returns the value when the limit is not reached\n"
+        "def check(value):\n    return value\n"
+    )
+    _repo, ptr = _indexed(
+        tmp_path,
+        monkeypatch,
+        {"src/budget.py": budget, "src/common.py": common},
+    )
+    idx = Path(ptr["indexPath"])
+    query = "the function returns the value past the limit, compute_retry_budget is wrong"
+
+    ranking = piece_file_ranking(idx, query)
+    assert [entry["kw_pos"] for entry in ranking] == list(range(1, len(ranking) + 1))
+    assert [entry["path"] for entry in piece_files(idx, query)][0] == "src/budget.py"
+
+
+def test_keyword_ranking_puts_a_test_file_below_an_equal_source_file(tmp_path, monkeypatch):
+    body = "def load_budget(path):\n    return read_budget(path)\n"
+    _repo, ptr = _indexed(
+        tmp_path,
+        monkeypatch,
+        {"src/budget.py": body, "tests/test_budget.py": body},
+    )
+    idx = Path(ptr["indexPath"])
+    paths = [entry["path"] for entry in piece_files(idx, "load_budget reads the budget")]
+    assert paths.index("src/budget.py") < paths.index("tests/test_budget.py")
+
+
+def test_find_rows_records_piece_parts_and_fuses_them_into_the_order(tmp_path, monkeypatch):
+    repo, ptr = _indexed(tmp_path, monkeypatch)
+    idx = Path(ptr["indexPath"])
+    # Under KEYWORD_FUSE_MIN_TERMS: the keyword list is neither recorded
+    # nor fused.
+    short = find_rows(idx, "auth session", limit=10, root=repo, root_id=ptr["rootId"])
+    assert all("piece_pos" not in row["parts"] for row in short)
+    assert all("keyword_fused" not in row["parts"] for row in short)
+
+    monkeypatch.setattr(search, "KEYWORD_FUSE_MIN_TERMS", 1)
+    rows = find_rows(idx, "auth session", limit=10, root=repo, root_id=ptr["rootId"])
+    assert any("piece_pos" in row["parts"] for row in rows)
+
+    monkeypatch.setattr(search, "piece_file_ranking", lambda *_args, **_kwargs: [])
+    without = find_rows(idx, "auth session", limit=10, root=repo, root_id=ptr["rootId"])
+    assert all("piece_pos" not in row["parts"] for row in without)
+    assert all("keyword_fused" not in row["parts"] for row in without)
+    assert [row["path"] for row in short] == [row["path"] for row in without]
+
+    # With no keyword ranking, the fusion is a no-op.
+    monkeypatch.setattr(search, "_keyword_fuse", lambda rows, _piece, _allowed: rows)
+    learned = find_rows(idx, "auth session", limit=10, root=repo, root_id=ptr["rootId"])
+    assert [(row["path"], row["score"]) for row in without] == [
+        (row["path"], row["score"]) for row in learned
+    ]
+
+
+def test_find_rows_skips_the_piece_ranking_for_a_short_query(tmp_path, monkeypatch):
+    repo, ptr = _indexed(tmp_path, monkeypatch)
+
+    def _must_not_run(*_args, **_kwargs):
+        raise AssertionError("piece_file_ranking ran for a short query")
+
+    monkeypatch.setattr(search, "piece_file_ranking", _must_not_run)
+    find_rows(Path(ptr["indexPath"]), "auth session", limit=10, root=repo, root_id=ptr["rootId"])
+
+
+def test_find_rows_fuses_the_keyword_list_once_the_query_is_long_enough(tmp_path, monkeypatch):
+    repo, ptr = _indexed(tmp_path, monkeypatch)
+    idx = Path(ptr["indexPath"])
+    monkeypatch.setattr(search, "KEYWORD_FUSE_MIN_TERMS", 1)
+    rows = find_rows(idx, "auth session", limit=10, root=repo, root_id=ptr["rootId"])
+    assert all("keyword_fused" in row["parts"] for row in rows)
+
+
+def _ranked_rows(count, start=0):
+    return [
+        {
+            "path": f"src/file_{start + i}.py",
+            "score": 100.0 - (start + i),
+            "reason": "",
+            "parts": {},
+        }
+        for i in range(count)
+    ]
+
+
+def test_keyword_fuse_lands_a_top_keyword_file_in_the_top_three():
+    rows = _ranked_rows(5)
+    # Keyword rank 1 ties MIMRY rank 3; path order breaks the tie.
+    pool = search._keyword_fuse(rows, {"src/aardvark.py": {"kw_pos": 1}}, lambda _path: True)
+    paths = [row["path"] for row in pool]
+    assert "src/aardvark.py" in paths[:3]
+    assert {row["path"] for row in pool} == {row["path"] for row in rows} | {"src/aardvark.py"}
+
+
+def test_keyword_fuse_keeps_a_first_ranked_row_above_a_tenth_ranked_row():
+    rows = _ranked_rows(12)
+    pool = search._keyword_fuse(rows, {"src/file_5.py": {"kw_pos": 3}}, lambda _path: True)
+    paths = [row["path"] for row in pool]
+    assert paths.index("src/file_0.py") < paths.index("src/file_9.py")
+
+
+def test_keyword_fuse_never_joins_a_disallowed_path():
+    rows = _ranked_rows(60)
+    # file_55 is in the tail. secret is not a candidate.
+    piece = {"src/secret.py": {"kw_pos": 1}, "src/file_55.py": {"kw_pos": 1}}
+    result = search._keyword_fuse(rows, piece, lambda path: path != "src/secret.py")
+    paths = [row["path"] for row in result]
+    assert "src/secret.py" not in paths
+    assert paths.index("src/file_55.py") < search.LEARNED_POOL
+
+
+def test_keyword_fuse_hands_the_pool_scores_out_in_descending_order():
+    rows = _ranked_rows(60)
+    piece = {"src/new.py": {"kw_pos": 1}, "src/file_3.py": {"kw_pos": 2}}
+    result = search._keyword_fuse(rows, piece, lambda _path: True)
+    old_pool_scores = [row["score"] for row in rows[: search.LEARNED_POOL]]
+    joined_floor = rows[search.LEARNED_POOL - 1]["score"]
+    new_pool = result[: search.LEARNED_POOL + 1]
+    assert [row["score"] for row in new_pool] == sorted(
+        [*old_pool_scores, joined_floor], reverse=True
+    )
+    assert all("keyword_fused" in row["parts"] for row in new_pool)
+    assert [row["path"] for row in result[search.LEARNED_POOL + 1 :]] == [
+        row["path"] for row in rows[search.LEARNED_POOL :]
+    ]
+
+
+def test_keyword_fuse_without_a_keyword_ranking_returns_rows_unchanged():
+    rows = _ranked_rows(5)
+    assert search._keyword_fuse(rows, {}, lambda _path: True) == rows
 
 
 def test_learned_top_ten_is_the_same_at_every_limit(tmp_path, monkeypatch):

@@ -38,7 +38,7 @@ from .mentions import (
     unindexed_file_names,
 )
 from .paths import canonical_cached_rel_path
-from .pieces import best_ranges, piece_matches
+from .pieces import best_ranges, piece_file_ranking, piece_matches
 from .security import filter_index_records
 from .semantic import merge_semantic_rows, semantic_rows
 from .storage import connect, load_jsonl, load_pointer
@@ -51,6 +51,14 @@ NAMED_DEFINITION_LIFT = 0.1
 NAMED_DEFINITION_CAP = 3
 # Rows the learned order reranks. Rows past the pool keep their order.
 LEARNED_POOL = 50
+# Rank offset in the reciprocal rank fusion of the keyword file list.
+KEYWORD_FUSE_K = 5
+# Weight of the keyword file list against MIMRY's own order.
+KEYWORD_FUSE_WEIGHT = 0.75
+# Keyword files that take part, by their place in the list.
+KEYWORD_FUSE_LIST = 30
+# Distinct query terms before fusion; short queries are name-like.
+KEYWORD_FUSE_MIN_TERMS = 20
 # Pairwise logistic regression over these parts, fitted on the SWE-bench
 # train set (tasks.train.json); refit when signals change.
 LEARNED_WEIGHTS = {
@@ -280,6 +288,31 @@ def _fts_scores(idx, q: str) -> dict[str, tuple[int, str]]:
     return scores
 
 
+def _piece_parts(idx, q, path_by_id) -> dict[str, dict]:
+    """Each file's place in the repository-wide piece ranking, by path,
+    for its row to carry as parts.
+    """
+    if not q:
+        return {}
+    # A file outside the pieces list has only the kw_* keys.
+    keys = ("piece_pos", "piece_best", "piece_sum", "piece_hits", "kw_pos", "kw_score")
+    return {
+        path_by_id[entry["file_id"]]: {key: entry[key] for key in keys if key in entry}
+        for entry in piece_file_ranking(idx, q)
+        if entry["file_id"] in path_by_id
+    }
+
+
+def _with_piece_parts(rows, piece_by_path):
+    """Add each row's piece ranking to its parts, if it has one."""
+    return [
+        {**row, "parts": {**row.get("parts", {}), **piece_by_path[row["path"]]}}
+        if row["path"] in piece_by_path
+        else row
+        for row in rows
+    ]
+
+
 def _with_ranges(idx, q, rows, id_by_path, cut_at, minified_paths=frozenset()):
     """Name the lines to read first in each result: its best pieces.
 
@@ -498,6 +531,48 @@ def _learned_rerank(rows, size_by_path):
     return reranked + rows[LEARNED_POOL:]
 
 
+def _keyword_fuse(rows, piece_by_path, allowed):
+    """Fuse the keyword file list into the learned pool (#42).
+
+    A pool row scores by its place in MIMRY's order. Each keyword file
+    within KEYWORD_FUSE_LIST adds its own reciprocal-rank term. A
+    keyword file outside the pool joins only if ``allowed`` accepts its
+    path. The pool keeps its own scores, handed out in the new order.
+    """
+    if not piece_by_path:
+        return rows
+    head, tail = rows[:LEARNED_POOL], rows[LEARNED_POOL:]
+    fused = {row["path"]: 1 / (KEYWORD_FUSE_K + rank) for rank, row in enumerate(head, start=1)}
+    members = {row["path"]: row for row in head}
+    tail_by_path = {row["path"]: row for row in tail}
+    floor = head[-1]["score"] if head else 0
+    for path, parts in piece_by_path.items():
+        kw_pos = parts.get("kw_pos")
+        if kw_pos is None or kw_pos > KEYWORD_FUSE_LIST:
+            continue
+        if path not in members:
+            if not allowed(path):
+                continue
+            members[path] = tail_by_path.get(path) or {
+                "path": path,
+                "score": floor,
+                "reason": "keyword match",
+                "parts": dict(parts),
+            }
+        fused[path] = fused.get(path, 0) + KEYWORD_FUSE_WEIGHT / (KEYWORD_FUSE_K + kw_pos)
+    pool = sorted(members.values(), key=lambda row: (-fused[row["path"]], row["path"]))
+    scores = sorted((row["score"] for row in pool), reverse=True)
+    pool = [
+        {
+            **row,
+            "score": score,
+            "parts": {**row.get("parts", {}), "keyword_fused": round(fused[row["path"]], 6)},
+        }
+        for row, score in zip(pool, scores, strict=True)
+    ]
+    return pool + [row for row in tail if row["path"] not in members]
+
+
 def _apply_exclusions(rows, q):
     excluded_terms = excluded_query_terms(q)
     if not excluded_terms:
@@ -626,6 +701,10 @@ def find_rows(
     if graph and (idx / "graph.json").exists():
         clusters = json.loads((idx / "graph.json").read_text()).get("clusters", {})
     terms = query_terms(q)
+    fuse_keywords = len(set(terms)) >= KEYWORD_FUSE_MIN_TERMS
+    # The keyword ranking only feeds the fusion and the kw_*/piece_*
+    # parts, so a short query skips its cost.
+    piece_by_path = _piece_parts(idx, q, file_paths) if fuse_keywords else {}
     intent = intent_terms(q)
     named = named_paths(q, known_paths)
     # A test file named only in the body of a source task (a traceback
@@ -634,6 +713,19 @@ def find_rows(
     exact_paths = {
         path for path in exact_name_paths(q, known_paths) if tests_asked or not is_test_file(path)
     }
+
+    def keyword_allowed(path):
+        """A keyword file joins the pool only if it is a candidate here.
+
+        It must be indexed and not excluded, and a test file only when
+        tests are asked.
+        """
+        return (
+            path in known_paths
+            and path not in excluded_paths
+            and (tests_asked or not is_test_file(path))
+        )
+
     for f in files:
         path = f["rel_path"]
         named_reason = EXACT_NAME_REASON if path in exact_paths else named.get(path)
@@ -733,7 +825,10 @@ def find_rows(
                 seen.add(r["path"])
             ranked = sorted(merged, key=lambda r: (-r["score"], r["path"]))
             ranked = _named_definition_lift(ranked, q, symbols, id_by_path)
+            ranked = _with_piece_parts(ranked, piece_by_path)
             ranked = _learned_rerank(ranked, size_by_path)
+            if fuse_keywords:
+                ranked = _keyword_fuse(ranked, piece_by_path, keyword_allowed)
             ranked = apply_feedback_to_rows(ranked, idx, root_id, q, known_paths=known_paths)
             ranked = _with_semantic(
                 ranked,
@@ -752,7 +847,10 @@ def find_rows(
             )
             return _with_ranges(idx, q, rows, id_by_path, cut_at, minified_paths)
     fallback_rows = _named_definition_lift(fallback_rows, q, symbols, id_by_path)
+    fallback_rows = _with_piece_parts(fallback_rows, piece_by_path)
     fallback_rows = _learned_rerank(fallback_rows, size_by_path)
+    if fuse_keywords:
+        fallback_rows = _keyword_fuse(fallback_rows, piece_by_path, keyword_allowed)
     ranked = apply_feedback_to_rows(fallback_rows, idx, root_id, q, known_paths=known_paths)
     ranked = _with_semantic(
         ranked,

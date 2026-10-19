@@ -126,7 +126,8 @@ The full per-instance output of the latest run, with each result's score line, i
 | After #239, #240 and #241 (37eb25b) | 34.8% | 63.8% | 74.6% | 67.6% | 77.7% |
 | 0.6.4 (main before #42's lift) | 35.2% | 64.0% | 74.6% | 67.8% | 77.9% |
 | Named-identifier lift (#42) | 37.6% | 65.4% | 77.2% | 69.5% | 80.2% |
-| Learned ranker (#42) | **42.8%** | **70.0%** | **79.0%** | **74.0%** | **81.7%** |
+| Learned ranker (#42) | 42.8% | 70.0% | 79.0% | 74.0% | 81.7% |
+| Keyword fusion (#42) | **44.8%** | **71.8%** | **81.4%** | **75.6%** | **84.0%** |
 
 The three changes were chosen and measured on the dev set first, one at a time, and Verified was run once with all three:
 
@@ -148,23 +149,28 @@ The weights are fixed integers in the source, so results stay deterministic, and
 On the dev set it moved Acc@1 from 30.4% to 31.8%, Acc@5 from 57.2% to 61.5% and Acc@10 from 66.6% to 67.6%; on Verified the first gold rank improved for 99 instances and worsened for 43.
 Dev token savings rose from 34.1% to 36.0% with full reads, and holdout2 located the same 33 tasks with mean recall@5 up from 62.9% to 66.3%.
 
+For queries with at least 20 distinct terms, `find` also ranks files by a keyword list: the rarest query terms matched against symbol pieces, whole files and exact symbol names, with tests, docs and `__init__.py` ranked down.
+That list is fused into the learned order by reciprocal rank (k = 5, weight 0.75, its top 30 files), chosen on the train set.
+Shorter queries skip it, since on them it moved no dev result and lost token-benchmark tasks.
+On the dev set it moved Acc@1 from 32.4% to 35.5% and Acc@10 from 67.9% to 69.2%.
+
 Acc@10 by repository:
 
 | Repository | Instances | 0.3.3 | Now |
 |---|---|---|---|
-| django/django | 231 | 66.7% | 81.8% |
-| sympy/sympy | 75 | 70.7% | 69.3% |
-| sphinx-doc/sphinx | 44 | 65.9% | 68.2% |
-| matplotlib/matplotlib | 34 | 55.9% | 79.4% |
+| django/django | 231 | 66.7% | 87.0% |
+| sympy/sympy | 75 | 70.7% | 72.0% |
+| sphinx-doc/sphinx | 44 | 65.9% | 70.5% |
+| matplotlib/matplotlib | 34 | 55.9% | 73.5% |
 | scikit-learn/scikit-learn | 32 | 87.5% | 93.8% |
-| astropy/astropy | 22 | 77.3% | 72.7% |
-| pydata/xarray | 22 | 40.9% | 86.4% |
+| astropy/astropy | 22 | 77.3% | 77.3% |
+| pydata/xarray | 22 | 40.9% | 81.8% |
 | pytest-dev/pytest | 19 | 52.6% | 84.2% |
-| pylint-dev/pylint | 10 | 20.0% | 50.0% |
+| pylint-dev/pylint | 10 | 20.0% | 40.0% |
 | psf/requests | 8 | 100.0% | 100.0% |
 | mwaskom/seaborn | 2 | 50.0% | 100.0% |
 | pallets/flask | 1 | 100.0% | 100.0% |
 
 When MIMRY finds a gold file, the median first gold rank is now 1.
-Instances whose fix touches more than one file remain the hardest: Acc@10 is 54.9% over those 71.
-77 instances still have no gold file in the top 10; ranking work continues in #42.
+Instances whose fix touches more than one file remain the hardest: Acc@10 is 56.3% over those 71.
+67 instances still have no gold file in the top 10; ranking work continues in #42.
