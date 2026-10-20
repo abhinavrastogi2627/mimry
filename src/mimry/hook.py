@@ -4,8 +4,9 @@ Claude Code runs this before matched tool calls. When an agent starts a
 broad search (a regex or case-insensitive grep, rg, ag, ack or git grep
 over the tree, a Grep call with a regex, or a Glob with a ``**``), it
 names the ``mimry find`` command to run instead. Exact-string searches
-stay quiet, and so does a shell search of one named file. The reminder
-is printed once per session and query, at most three times per session.
+stay quiet, and so does a shell search of one named file, of up to five
+named files, or of a pipe's output. The reminder is printed once per
+session and query, at most three times per session.
 
 When a search over the tree names a symbol the index knows, the hook
 answers with its definition and top callers instead, read from the
@@ -73,6 +74,10 @@ LEADING_WORD = re.compile(r"([A-Za-z]+)\s+")
 SEARCH_PROGRAMS = {"grep", "rg", "ag", "ack", "git"}
 # These recurse into subdirectories without needing -r.
 RECURSIVE_BY_DEFAULT = {"rg", "ag", "ack", "git"}
+# Searches that read a pipe when they name no path. grep reads one only
+# without -r, since grep -r searches the tree. git grep never reads one.
+PIPE_READERS = {"grep", "rg", "ag"}
+PIPE_OPERATORS = frozenset({"|", "|&"})
 # Short and long options that take a separate value.
 SHORT_WITH_VALUE = set("eABCDdfgjmMtT")
 LONG_WITH_VALUE = {
@@ -135,6 +140,9 @@ PROMPT_COMMON_WORDS = frozenset(
 )
 # Generic reminders shown per session; symbol answers are not capped.
 NUDGE_LIMIT = 3
+# A search naming up to this many existing files is a targeted lookup,
+# like a search of one file. More files, a directory or a glob is broad.
+EXPLICIT_FILE_LIMIT = 5
 # hook-sessions keeps every key of the HOOK_SESSION_LIMIT most recently
 # active sessions, up to HOOK_KEYS_PER_SESSION keys each. A key past
 # that limit is forgotten, and the oldest session goes first.
@@ -162,12 +170,14 @@ _HEAVY_IGNORES_CASEFOLD = frozenset(part.casefold() for part in HEAVY_IGNORES)
 
 
 class _Search(NamedTuple):
-    """One shell search: its pattern, flags and the paths it names."""
+    """One shell search: its pattern, flags, the paths it names, and
+    whether it reads a pipe rather than the tree."""
 
     pattern: str | None
     ignore_case: bool
     recursive: bool
     paths: list[str]
+    reads_pipe: bool
 
 
 def cmd_hook_check(a) -> int:
@@ -264,10 +274,11 @@ def _next_value(args: list[str], i: int, attached: str = "") -> tuple[str, int]:
     return "", i
 
 
-def _parse_search(words: list[str]) -> _Search | None:
+def _parse_search(words: list[str], piped: bool = False) -> _Search | None:
     """Pattern, flags and paths of one command.
 
-    Returns None when the command is not grep, rg, ag, ack or git grep.
+    ``piped`` says the command is fed by a pipe. Returns None when the
+    command is not grep, rg, ag, ack or git grep.
     """
     if not words:
         return None
@@ -326,7 +337,10 @@ def _parse_search(words: list[str]) -> _Search | None:
         explicit, paths = positional[0], positional[1:]
     else:
         paths = positional
-    return _Search(explicit, ignore_case, recursive, paths)
+    reads_pipe = (
+        piped and not paths and program in PIPE_READERS and (program != "grep" or not recursive)
+    )
+    return _Search(explicit, ignore_case, recursive, paths, reads_pipe)
 
 
 def _keep_backslashes(command: str) -> str:
@@ -379,47 +393,63 @@ def _shell_searches(command: str) -> list[_Search]:
     except ValueError:
         return []
     segments: list[list[str]] = [[]]
+    # Whether each segment is the target of a pipe, not of && or ;.
+    piped = [False]
     for tok in tokens:
         if SEPARATOR.fullmatch(tok):
             segments.append([])
+            piped.append(tok in PIPE_OPERATORS)
         else:
             segments[-1].append(tok)
-    found = (_parse_search(words) for words in segments)
+    found = (_parse_search(words, fed) for words, fed in zip(segments, piped, strict=True))
     return [search for search in found if search is not None]
 
 
 def shell_search_pattern(command: str, root: Path) -> str | None:
     """Pattern of the first broad search of the tree in a shell command.
 
-    A search of one named file is skipped. Returns None when there is
-    none, or when the command does not parse.
+    A search of a few named files, or of a pipe's output, is skipped.
+    Returns None when there is none, or when the command does not parse.
     """
     for search in _shell_searches(command):
         if (
             search.recursive
             and search.pattern is not None
             and (search.ignore_case or regex_is_broad(search.pattern))
-            and not _is_one_file(search.paths, root)
+            and _searches_tree(search, root)
         ):
             return search.pattern
     return None
 
 
-def _is_one_file(paths: list[str], root: Path) -> bool:
-    """Whether every path a search names is a regular file, so the
-    search covers no tree. A search with no path covers the tree.
+def _searches_tree(search: _Search, root: Path) -> bool:
+    """Whether ``search`` covers files of the tree under ``root``."""
+    return not search.reads_pipe and not _names_explicit_files(search.paths, root)
+
+
+def _names_explicit_files(paths: list[str], root: Path) -> bool:
+    """Whether ``paths`` is a short list of existing files.
+
+    Such a search covers no tree. Up to EXPLICIT_FILE_LIMIT paths, each
+    a regular file and no glob. A search with no path covers the tree.
 
     A backslash is a separator here, as a Windows shell writes paths."""
-    return bool(paths) and all((root / path.replace("\\", "/")).is_file() for path in paths)
+    if not 0 < len(paths) <= EXPLICIT_FILE_LIMIT:
+        return False
+    return all(
+        not any(ch in path for ch in "*?[") and (root / path.replace("\\", "/")).is_file()
+        for path in paths
+    )
 
 
 def shell_tree_patterns(command: str, root: Path) -> list[str]:
     """Patterns of every recursive search over the tree in ``command``,
-    broad or exact. A search of one named file is left out."""
+    broad or exact. A search of a pipe or of a few named files is left
+    out."""
     return [
         search.pattern
         for search in _shell_searches(command)
-        if search.recursive and search.pattern is not None and not _is_one_file(search.paths, root)
+        if search.recursive and search.pattern is not None and _searches_tree(search, root)
     ]
 
 
@@ -537,23 +567,48 @@ def _pattern_names(pattern: str) -> list[str]:
     return names
 
 
-def symbol_candidates(patterns: list[str]) -> list[str]:
-    """Identifiers that ``patterns`` search for as whole symbols.
+def symbol_lookup_names(patterns: list[str]) -> list[str]:
+    """Every whole name the patterns spell, to look up in the index.
 
-    A pattern names symbols only when all of it is whole names, such as
-    ``foo``, ``def foo`` or ``(foo|bar)``. A phrase, a wildcard or a
-    glued group gives nothing for that pattern, and the caller falls
-    back to the nudge.
+    Each branch of an alternation is included, so the caller can check
+    that all of them are symbols.
     """
     names: list[str] = []
     for pattern in patterns:
         for raw in _pattern_names(pattern):
+            if raw not in names:
+                names.append(raw)
+    return names[:SYMBOL_CANDIDATE_LIMIT]
+
+
+def symbol_candidates(patterns: list[str], known: set[str] | None = None) -> list[str]:
+    """Identifiers that ``patterns`` search for as whole symbols.
+
+    A pattern names symbols only when all of it is whole names, such as
+    ``foo``, ``def foo`` or ``\\bfoo\\b``. A phrase, a wildcard or a
+    glued group gives nothing for that pattern, and the caller falls
+    back to the nudge.
+
+    ``known`` is the set of names the index defines. When it is given,
+    an alternation names its branches only if every branch is known, so
+    ``def a|def b`` names both and ``skip|key|push`` names nothing when
+    ``push`` is not a symbol. Without it, every branch of a whole-name
+    alternation is named.
+    """
+    names: list[str] = []
+    for pattern in patterns:
+        raws = _pattern_names(pattern)
+        if known is not None and len(raws) > 1 and not all(raw in known for raw in raws):
+            continue
+        for raw in raws:
             word = usable_word(raw)
             # Dunder names such as __init__ are defined in nearly every
             # file, so an answer naming one would be noise.
             if word is None or word in DECLARATION_WORDS or word in names:
                 continue
             if word.startswith("__") and word.endswith("__"):
+                continue
+            if known is not None and raw not in known:
                 continue
             names.append(word)
     return names[:SYMBOL_CANDIDATE_LIMIT]
@@ -858,21 +913,28 @@ def _symbol_answer(
     wrong, so the caller falls back to the reminder.
     """
     try:
-        names = symbol_candidates(tree_search_patterns(tool_name, tool_input, command, root))
-        if not names:
+        patterns = tree_search_patterns(tool_name, tool_input, command, root)
+        lookup = symbol_lookup_names(patterns)
+        if not lookup:
             return None
         from datetime import datetime
 
         pointer = json.loads((root / ".mimry" / "pointer.json").read_text(encoding="utf-8"))
         index = Path(pointer["indexPath"])
         indexed_at = datetime.fromisoformat(pointer["lastIndexedAt"]).timestamp()
-        defs = _definitions(root, index, names, indexed_at)
+        defs = _definitions(root, index, lookup, indexed_at)
         if not defs:
             return None
+        # Only names the index defines are answered, and an alternation
+        # only when every one of its branches is defined.
+        names = symbol_candidates(patterns, known=set(defs))
         graph = _load_graph(index)
         mimry_dir = root / ".mimry"
         texts = []
-        for name, found in defs.items():
+        for name in names:
+            found = defs.get(name)
+            if found is None:
+                continue
             if len(texts) == SYMBOL_LIMIT:
                 break
             # Once per session, like the reminder: a symbol answered

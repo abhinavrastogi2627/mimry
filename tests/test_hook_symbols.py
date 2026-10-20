@@ -292,10 +292,10 @@ def test_heading_and_sql_table_named_like_a_function_are_not_answered(repo, monk
     _index_again(repo)
 
     assert _hook(monkeypatch, capsys, repo, _grep("files")) == ""
+    # files is not a symbol, so the alternation with leaf names nothing.
     text = _hook(monkeypatch, capsys, repo, _grep("leaf|files"))
-    assert text == (
-        "MIMRY knows leaf: function at app/one.py:5.\nCalled by helper (app/one.py:1)."
-    )
+    assert text.startswith("MIMRY can answer this")
+    assert "MIMRY knows" not in text
 
 
 def test_glob_with_no_words_gets_no_nudge(repo, monkeypatch, capsys):
@@ -335,6 +335,107 @@ def test_search_of_a_directory_or_the_tree_still_gets_the_nudge(
     text = _hook(monkeypatch, capsys, repo, _shell(command))
 
     assert text.startswith('MIMRY can answer this: run `mimry find "alpha bravo"`')
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'cat app/one.py | rg -i "helper|leaf"',
+        "cat app/one.py | rg -n leaf",
+        'cat app/one.py 2>&1 | rg -i "helper|leaf"',
+        "echo ok && cat app/one.py | rg -n leaf",
+        'rg -n "def leaf" app/one.py | rg -n "set|mode|read|options"',
+    ],
+)
+def test_search_that_reads_a_pipe_gets_no_answer_or_nudge(repo, monkeypatch, capsys, command):
+    assert _hook(monkeypatch, capsys, repo, _shell(command)) == ""
+
+
+@pytest.mark.parametrize(
+    ("command", "start"),
+    [
+        (
+            'cat app/one.py | rg -n "def leaf" app',
+            "MIMRY knows leaf: function at app/one.py:5.",
+        ),
+        (
+            'cat app/one.py | rg -i "helper|notasymbol" app',
+            'MIMRY can answer this: run `mimry find "helper notasymbol"`',
+        ),
+        (
+            'cat app/one.py && rg -i "helper|notasymbol"',
+            'MIMRY can answer this: run `mimry find "helper notasymbol"`',
+        ),
+    ],
+)
+def test_search_fed_by_a_pipe_still_counts_when_it_names_a_path(
+    repo, monkeypatch, capsys, command, start
+):
+    assert _hook(monkeypatch, capsys, repo, _shell(command)).startswith(start)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _grep("leaf|notasymbol"),
+        _shell('rg -n "helper|leaf|notasymbol" app'),
+        _shell('rg -n "def helper|def nothing" app'),
+    ],
+)
+def test_word_regex_with_an_unknown_branch_names_nothing(repo, monkeypatch, capsys, payload):
+    text = _hook(monkeypatch, capsys, repo, payload)
+
+    assert text.startswith("MIMRY can answer this: run `mimry find")
+    assert "MIMRY knows" not in text
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [_grep("def helper|def leaf"), _shell('rg -n "def helper|def leaf" app')],
+)
+def test_def_alternation_answers_both_definitions(repo, monkeypatch, capsys, payload):
+    text = _hook(monkeypatch, capsys, repo, payload)
+
+    assert text.startswith("MIMRY knows helper: function at app/one.py:1.")
+    assert "MIMRY knows leaf: function at app/one.py:5." in text
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _shell("rg -w leaf app"),
+        _shell(r'rg -n "\bleaf\b" app'),
+        _shell("rg -n leaf app"),
+        _grep("(leaf)"),
+    ],
+)
+def test_plain_identifier_forms_still_get_the_symbol_answer(repo, monkeypatch, capsys, payload):
+    text = _hook(monkeypatch, capsys, repo, payload)
+
+    assert text == (
+        "MIMRY knows leaf: function at app/one.py:5.\nCalled by helper (app/one.py:1)."
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'rg -i "helper|leaf" app/one.py app/two.py',
+        r'rg -i "helper|leaf" app\one.py app\two.py',
+    ],
+)
+def test_a_few_named_files_get_no_answer_or_nudge(repo, monkeypatch, capsys, command):
+    assert _hook(monkeypatch, capsys, repo, _shell(command)) == ""
+
+
+def test_more_than_five_named_files_is_a_tree_search(repo, monkeypatch, capsys):
+    for n in range(1, 5):
+        (repo / "app" / f"f{n}.py").write_text("x = 1\n", encoding="utf-8")
+    files = " ".join(["app/one.py", "app/two.py", *(f"app/f{n}.py" for n in range(1, 5))])
+
+    text = _hook(monkeypatch, capsys, repo, _shell(f'rg -i "helper|notasymbol" {files}'))
+
+    assert text.startswith('MIMRY can answer this: run `mimry find "helper notasymbol"`')
 
 
 def _module(total: int, defs: dict[int, str]) -> str:
