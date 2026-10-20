@@ -1136,16 +1136,87 @@ def _settings_line(path: Path, root: Path, project: bool, what: str) -> str:
     return f"Removed {shown}" if not path.exists() else f"Removed MIMRY's {what} from {shown}"
 
 
-def _resolve_executable(name: str) -> str:
-    found = which(name)
-    if found:
-        return found
+# uv's cache buckets for the environments `uvx` and `uv run --with` make
+# (checked against uv 0.11 on Windows, where `uv cache dir` is
+# %LOCALAPPDATA%\uv\cache). uv may delete them at any time.
+_THROWAWAY_ENV_BUCKETS = frozenset({"archive-v0", "builds-v0"})
+
+
+def _in_throwaway_env() -> bool:
+    """True when the running interpreter sits in a uv cache environment.
+
+    The script beside such an interpreter can vanish with the cache, so
+    PATH is preferred there.
+    """
+    return any(part in _THROWAWAY_ENV_BUCKETS for part in Path(sys.executable).parts)
+
+
+def _script_beside_interpreter(name: str) -> str | None:
     scripts_dir = Path(sys.executable).parent
     for suffix in (".exe", ""):
         candidate = scripts_dir / (name + suffix)
         if candidate.exists():
             return str(candidate)
-    return name
+    return None
+
+
+@functools.cache
+def _path_mimry_version() -> str | None:
+    """The version the mimry on PATH reports, or None when unreadable.
+
+    Runs `mimry --version` once per process. Any failure counts as
+    unknown, and the caller then uses this install's script.
+    """
+    path = which("mimry")
+    if path is None:
+        return None
+    try:
+        done = subprocess.run(
+            [path, "--version"], capture_output=True, encoding="utf-8", errors="replace", timeout=5
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.fullmatch(r"mimry (\S+)\s*", done.stdout) if done.returncode == 0 else None
+    return match.group(1) if match else None
+
+
+def _resolve_executable(name: str) -> str:
+    """The `name` script to register.
+
+    PATH's copy when it is the same file, when the running interpreter
+    is a throwaway env, or when PATH's mimry is the same version as this
+    install. A uv tool's trampoline is another file from the tool env's
+    script but runs the same mimry, so it counts. Otherwise the script
+    beside the running interpreter, so the install registers its own
+    version. Then the bare name.
+    """
+    found = which(name)
+    beside = _script_beside_interpreter(name)
+    if beside is None:
+        return found or name
+    if found is None:
+        return beside
+    if _same_file(found, beside) or _in_throwaway_env():
+        return found
+    if _path_mimry_version() == __version__:
+        return found
+    return beside
+
+
+def _warn_if_path_differs() -> None:
+    """Warn when the mimry on PATH is not this install's, naming both.
+
+    Hooks and the MCP server then run this install, not the one a shell
+    finds first. Both versions are shown, so the mismatch is visible.
+    """
+    on_path = which("mimry")
+    own = _resolve_mimry_exe()
+    if on_path and not _same_file(on_path, own):
+        path_version = _path_mimry_version() or "an unknown version"
+        ui.warn(
+            f"`mimry` on PATH is {path_version} ({on_path}); hooks and the MCP server"
+            f" use this install, {__version__} ({own})"
+        )
 
 
 def _resolve_mimry_exe() -> str:
@@ -1779,6 +1850,7 @@ def install_skill(
             f"hooks in {cfg.hook_path.as_posix()} that name `mimry find` for broad searches,"
             " answer searches for known symbols, and refresh the index in the background"
         )
+    _warn_if_path_differs()
     if dry_run:
         print("Dry run - nothing was written")
         ui.detail(
