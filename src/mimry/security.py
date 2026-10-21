@@ -446,6 +446,11 @@ _ENV_LOOKUP_RE = re.compile(
 # Where a value ends outside parsed source: a separator, the line end,
 # or a comment, which follows whitespace.
 _VALUE_END_RE = re.compile(r"[ \t]*(?:[,;)\]}\r\n`]|\\(?=[nrt\"'])|\Z|(?<=[ \t])(?:#|//))")
+# Prose after a closing quote: a blank, then a word that is not a
+# keyword which continues an expression, as in ``"x" in config.``.
+# ``"x" or "y"`` and ``"x" if c else "y"`` still continue, and their
+# values are scanned.
+_PROSE_AFTER_QUOTE_RE = re.compile(r"[ \t]+(?!(?:or|and|if|else)\b)[A-Za-z_]")
 _CLOSING_BACKTICK_RE = re.compile(r"[ \t]*`")
 _LINE_REST_RE = re.compile(r"[^\r\n]*")
 _LINE_BREAK_RE = re.compile(r"[ \t]*\r?\n")
@@ -572,7 +577,8 @@ def _contains_sensitive_text(text: str, *, code: bool, depth: int) -> bool:
     ):
         return True
     if any(
-        _is_sensitive_label(match.group("label"), match.group("body"))
+        _holds_text(match.group("body"))
+        and _is_sensitive_label(match.group("label"), match.group("body"))
         for match in YAML_BLOCK_ASSIGNMENT_RE.finditer(text)
     ):
         return True
@@ -589,7 +595,7 @@ def _contains_sensitive_text(text: str, *, code: bool, depth: int) -> bool:
     # one is exact, and the scan is one of the costliest over large
     # sources.
     if ('"""' in text or "'''" in text) and any(
-        _is_sensitive_label(match.group("label"))
+        _is_sensitive_label(match.group("label")) and _holds_text(_triple_quoted_body(text, match))
         for match in MULTILINE_QUOTED_ASSIGNMENT_START_RE.finditer(text)
     ):
         return True
@@ -657,11 +663,13 @@ def _redact_text(text: str, *, depth: int) -> str:
     redacted = _redact_url_credentials(redacted)
     redacted = _redact_auth_headers(redacted)
     redacted = _redact_unclosed_quoted_values(redacted)
-    redacted = _redact_values(redacted, SPACED_SENSITIVE_ASSIGNMENT_RE, _redact_spaced_assignment)
+    redacted = _redact_values(
+        redacted, SPACED_SENSITIVE_ASSIGNMENT_RE, _redact_spaced_assignment, prose=depth > 0
+    )
     redacted = YAML_BLOCK_ASSIGNMENT_RE.sub(_redact_yaml_block, redacted)
     redacted = _redact_yaml_quoted_multiline(redacted)
     redacted = _redact_hash_entries(redacted)
-    redacted = _redact_values(redacted, ASSIGNMENT_RE, _redact_assignment)
+    redacted = _redact_values(redacted, ASSIGNMENT_RE, _redact_assignment, prose=depth > 0)
     redacted = LITERAL_COMPARED_RE.sub(_redact_literal_comparison, redacted)
     redacted = LABEL_COMPARED_RE.sub(_redact_label_comparison, redacted)
     redacted = TUPLE_LABELED_RE.sub(_redact_tuple, redacted)
@@ -751,6 +759,9 @@ def _value_is_credential(
         not candidate
         or candidate in {REDACTED, REDACTED + '"', REDACTED + "'"}
         or candidate[0] == "|"
+        # A quoted block whose lines are only the marker, as a triple-
+        # quoted value redacted line by line, is already redacted.
+        or (REDACTED in candidate and not _holds_text(candidate.strip("\"'`")))
     ):
         return False  # nothing assigned, already redacted, or a YAML block (classified above)
     # Punctuation alone (``...``, ``***``, ``---``) has no letter or
@@ -1094,9 +1105,12 @@ class _Scanner:
     across lines: what redaction leaves in place leaves MIMRY.
     """
 
-    def __init__(self, text: str, *, redaction: bool = False) -> None:
+    def __init__(self, text: str, *, redaction: bool = False, prose: bool = False) -> None:
         self.text = text
         self.redaction = redaction
+        # Whether the text is prose, a comment or a string's text (see
+        # _redact_text), where a quoted value may be followed by words.
+        self.prose = prose
         self.left = 4 * len(text) + 1024
         self._tuple_slots: list[_TupleSlot] | None = None
         self._tuple_label_starts: set[int] | None = None
@@ -1185,6 +1199,13 @@ def _scan_value(
             if literal is None:
                 newline = text.find("\n", at)
                 return _Value(literals, "".join(shape), end if newline < 0 else newline, False)
+            triple = lead * 3 if lead in "\"'" else lead
+            if text.startswith(triple, at) and not literal["literal"].startswith(triple):
+                # A triple quote the text never closes, as the closing
+                # quotes of a docstring after a value, ends the value.
+                # The short pattern would read its first two quotes as
+                # an empty string.
+                return _Value(literals, "".join(shape), prefix, True)
             if every_literal or not counted or counted[-1]:
                 literals.append(literal)
             if not counted:
@@ -1389,7 +1410,7 @@ def _is_comparison(match: re.Match[str]) -> bool:
     return match.group("separator").strip(" \t") in COMPARISON_OPERATORS
 
 
-def _redact_values(text: str, pattern: re.Pattern[str], render) -> str:
+def _redact_values(text: str, pattern: re.Pattern[str], render, *, prose: bool = False) -> str:
     """Replace each match ``render`` redacts, through the end of its
     value.
 
@@ -1398,7 +1419,7 @@ def _redact_values(text: str, pattern: re.Pattern[str], render) -> str:
     goes on, replacing just the capture left ``or "fallback"``, later
     arguments, later elements and the rest of ``KEY=a,b`` in place.
     """
-    scanner = _Scanner(text, redaction=True)
+    scanner = _Scanner(text, redaction=True, prose=prose)
     pieces: list[str] = []
     pos = 0
     for match in pattern.finditer(text):
@@ -1412,6 +1433,13 @@ def _redact_values(text: str, pattern: re.Pattern[str], render) -> str:
         if end is None:
             pieces.append(REDACTED)  # nested past the budget: fail closed
             return "".join(pieces)
+        value_span = text[match.start("value") : end]
+        if "\n" in value_span or "\r" in value_span:
+            # A value over several lines keeps its line breaks, so each
+            # line is redacted in place instead of collapsing to one.
+            replacement = text[match.start() : match.start("value")] + _redacted_multiline(
+                value_span
+            )
         pieces.append(replacement)
         pos = end
     pieces.append(text[pos:])
@@ -1434,6 +1462,10 @@ def _redacted_value_end(match: re.Match[str], scanner: _Scanner) -> int | None:
         # code of its own (``and ok:``), kept for later matches.
         return end
     quoted = value.strip().lstrip(">").lstrip()[:1] in ('"', "'")  # after ``=>`` too
+    if quoted and scanner.prose and _PROSE_AFTER_QUOTE_RE.match(text, end):
+        # Prose after the closing quote is text of its own, as in
+        # ``"x" in config.`` (#520).
+        return end
     if (
         value.count("(") + value.count("[") > value.count(")") + value.count("]")
         or (quoted and not _VALUE_END_RE.match(text, end))
@@ -1905,12 +1937,14 @@ def _redact_hash_entries(text: str) -> str:
 
 
 def _redact_yaml_block(match: re.Match[str]) -> str:
-    if not _is_sensitive_label(match.group("label"), match.group("body")):
+    body = match.group("body")
+    if not _holds_text(body) or not _is_sensitive_label(match.group("label"), body):
         return match.group(0)
-    newline = "\r\n" if "\r\n" in match.group("header") else "\n"
+    # Each body line keeps its indent and its line break, so the block
+    # keeps its line count and stays valid YAML.
     return (
-        f"{match.group('indent')}{match.group('label')}{match.group('header')}{match.group('indent')}"
-        f"  {REDACTED}{newline}"
+        f"{match.group('indent')}{match.group('label')}{match.group('header')}"
+        f"{_redacted_multiline(body, comments=False)}"
     )
 
 
@@ -2077,12 +2111,175 @@ def _holds_text(value: str) -> bool:
     return _MARKER_OR_BLANK_RE.sub("", value) != ""
 
 
+def _triple_quoted_body(text: str, match: re.Match[str]) -> str:
+    """The text of a triple-quoted string, from the quote the match ends
+    on to its closing quote, or to the end of the text when it never
+    closes."""
+    close = text.find(match.group("quote"), match.end())
+    return text[match.end() : len(text) if close < 0 else close]
+
+
 def _redacted_lines(value: str) -> str:
     """The value with each run of text on a line replaced by the marker.
 
     Every line break stays, so the line count does not change.
     """
     return re.sub(r"[^\r\n]+", REDACTED, value)
+
+
+# A letter or digit, as str.isalnum counts them; a single search is much
+# faster than a Python loop over each character of a long value.
+_ALNUM_RE = re.compile(r"[^\W_]")
+# A comment that starts a piece of a value's line.
+_VALUE_COMMENT_RE = re.compile(r"[ \t]*(?:#|//)")
+# A line break, kept between the lines of a value.
+_LINE_BREAK_SPLIT_RE = re.compile(r"(\r\n|\r|\n)")
+# A triple quote, which opens or closes a string that runs over lines.
+_TRIPLE_QUOTE_RE = re.compile(r"\"\"\"|'''")
+# The delimiters a value's line may start with, and may end with.
+_VALUE_LEAD_DELIMITERS = "\"'`([{)]}"
+_VALUE_TRAIL_DELIMITERS = "\"'`([{)]},;"
+
+
+def _value_line_bounds(text: str) -> tuple[int, int]:
+    """Where the body of a value's line starts and ends. Its leading
+    spaces and delimiters, and its trailing delimiters and spaces, are
+    not body. Each end is scanned once, so a long run of spaces stays
+    linear."""
+    start = 0
+    while start < len(text) and text[start] in " \t":
+        start += 1
+    while start < len(text) and text[start] in _VALUE_LEAD_DELIMITERS:
+        start += 1
+    end = len(text.rstrip(" \t"))
+    while end > start and text[end - 1] in _VALUE_TRAIL_DELIMITERS:
+        end -= 1
+    return start, end
+
+
+def _redacted_multiline(value: str, *, comments: bool = True) -> str:
+    """The value with the text of each of its lines redacted, as in a
+    ``password = (`` block, a triple-quoted string or a YAML ``|``
+    block.
+
+    Line breaks, indents and delimiters stay, so the value keeps its
+    line count and still parses. A line with no letter or digit has no
+    text to redact and is kept.
+
+    ``comments`` says whether a line starting with ``#`` or ``//`` is a
+    comment, as in code. In a YAML block scalar, and inside a
+    triple-quoted string, such a line is text to redact.
+    """
+    parts = _LINE_BREAK_SPLIT_RE.split(value)
+    state: str | None = None  # the triple quote a string is open with
+    # Line breaks sit at odd indexes, so the lines are the even ones.
+    for index in range(0, len(parts), 2):
+        line = parts[index]
+        content = not comments or state is not None
+        parts[index] = _redacted_value_line(line, comments=not content)
+        if not comments or (state is None and _VALUE_COMMENT_RE.match(line)):
+            continue
+        state = _triple_state_after(line, state)
+    return "".join(parts)
+
+
+def _triple_state_after(line: str, state: str | None) -> str | None:
+    """The triple quote a string is open with after this line, or
+    None."""
+    if '"""' not in line and "'''" not in line:
+        return state
+    for found in _TRIPLE_QUOTE_RE.finditer(line):
+        if state is None:
+            state = found.group()
+        elif found.group() == state:
+            state = None
+    return state
+
+
+# The quotes a string literal in a value's line may open with.
+_LITERAL_QUOTE_RE = re.compile(r"[\"'`]")
+# The prefix letters a string literal may have before its quote.
+_LITERAL_PREFIXES = "rRbBuUfF"
+
+
+def _value_literal_spans(line: str) -> list[tuple[int, int]]:
+    """The non-empty string literals of a line of a value, as spans. A
+    literal runs to the next quote of its kind that is not escaped, and
+    a quote whose literal never closes on the line makes every later
+    quote of its kind fail too. So one pass finds them all, in linear
+    time, where a regex restarted at each quote was quadratic."""
+    spans: list[tuple[int, int]] = []
+    dead: set[str] = set()
+    pos = 0
+    index = 0
+    while (found := _LITERAL_QUOTE_RE.search(line, index)) is not None:
+        index = found.start()
+        quote = line[index]
+        if quote in dead:
+            index += 1
+            continue
+        close = _literal_close(line, index)
+        if close is None:
+            dead.add(quote)
+            index += 1
+        elif close == index + 1:
+            index += 1  # an empty pair is not a literal
+        else:
+            start = index
+            while start > pos and index - start < 2 and line[start - 1] in _LITERAL_PREFIXES:
+                start -= 1
+            spans.append((start, close + 1))
+            pos = index = close + 1
+    return spans
+
+
+def _literal_close(line: str, index: int) -> int | None:
+    """The index of the quote that closes the string opened at
+    ``index``, or None when the line ends first."""
+    quote = line[index]
+    pos = index + 1
+    while pos < len(line):
+        char = line[pos]
+        if char == "\\":
+            if pos + 1 == len(line):
+                return None
+            pos += 2
+            continue
+        if char == quote:
+            return pos
+        pos += 1
+    return None
+
+
+def _redacted_value_line(line: str, *, comments: bool = True) -> str:
+    """One line of a value. Its string literals are redacted whole, and
+    the text between them is redacted as one piece, so each quote stays
+    paired."""
+    pieces: list[str] = []
+    pos = 0
+    # An empty pair is not a literal here: on a line of a triple-quoted
+    # string, the first two quotes of ``"""`` are not one.
+    for start, end in _value_literal_spans(line):
+        pieces.append(_redacted_value_text(line[pos:start], comments=comments))
+        pieces.append(_redacted_secret(line[start:end]))
+        pos = end
+    pieces.append(_redacted_value_text(line[pos:], comments=comments))
+    return "".join(pieces)
+
+
+def _redacted_value_text(text: str, *, comments: bool = True) -> str:
+    # A comment after a value's literal is judged as text of its own
+    # (see SUB_TEXT_RE), so it stays, as a line of code does.
+    if comments and _VALUE_COMMENT_RE.match(text):
+        return text
+    # A line holding only the marker is already redacted. Wrapping it
+    # again would grow the marker on every pass.
+    if _ALNUM_RE.search(text.replace(REDACTED, "")) is None:
+        return text
+    start, end = _value_line_bounds(text)
+    if _ALNUM_RE.search(text, start, end) is None:
+        return text
+    return text[:start] + REDACTED + text[end:]
 
 
 def _quote_close(text: str, start: int, quote: str) -> tuple[int, bool] | None:
