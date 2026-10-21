@@ -39,6 +39,10 @@ SESSION_IGNORED_LIMIT = 5
 # must not wait on feedback bookkeeping, so the flush only tries. This
 # is the smallest positive wait, since the lock helper rejects zero.
 SESSION_LOCK_WAIT = 0.001
+# The Stop hook runs async, so it can wait for the lock. On Windows a
+# scanner or indexer can hold the lock file for a few milliseconds, and
+# a turn-end flush that gives up at once loses its window for good.
+SESSION_STOP_LOCK_WAIT = 5.0
 # The file log's append lock. A hook waits for it up to APPEND_WAIT, so
 # an event is never appended without it; a lock older than APPEND_STALE
 # came from a process that died holding it.
@@ -425,14 +429,20 @@ def _window_end(
     index: int,
     session: str,
     stops: list[float],
-) -> float | None:
-    """When the query at ``index`` stops owning events, or None if open.
+) -> tuple[float | None, bool]:
+    """When the query at ``index`` stops owning events, and whether that
+    end is included in the window.
 
     A query with a session id ends at that session's next query, or at
-    the first turn-end mark of the session after it, whichever comes
-    first. One without ends at the next query of any session, as before
-    sessions were recorded. ``stops`` are the session's mark times,
-    oldest first.
+    the first turn-end mark of the session at or after its own stamp,
+    whichever comes first. One without ends at the next query of any
+    session, as before sessions were recorded. ``stops`` are the
+    session's mark times, oldest first.
+
+    A turn-end mark is included: the Stop hook runs after the turn's
+    tool calls, and on a clock that advances in steps (before Python
+    3.13 on Windows, about 15.6 ms) a file event can carry the mark's
+    own stamp. A next query is excluded, so its own events stay with it.
     """
     begin = timed[index][0]
     end = None
@@ -441,11 +451,11 @@ def _window_end(
             end = next_begin
             break
     for stop in stops:
-        if stop > begin:
+        if stop >= begin:
             if end is None or stop < end:
-                end = stop
+                return stop, True
             break
-    return end
+    return end, False
 
 
 def _flush_plan(state: Path, now: float) -> dict[str, Any] | None:
@@ -495,7 +505,9 @@ def _flush_plan(state: Path, now: float) -> dict[str, Any] | None:
             if keep:
                 kept_queries.append(query)
             continue
-        end = _window_end(timed_queries, index, session, stops_by_session.get(session, []))
+        end, inclusive = _window_end(
+            timed_queries, index, session, stops_by_session.get(session, [])
+        )
         if end is None and now - begin <= SESSION_WINDOW_IDLE:
             kept_queries.append(query)
             continue
@@ -503,7 +515,7 @@ def _flush_plan(state: Path, now: float) -> dict[str, Any] | None:
             e
             for t, e in timed_events
             if t >= begin
-            and (end is None or t < end)
+            and (end is None or (t <= end if inclusive else t < end))
             and (not session or _session_of(e) == session)
         ]
         opened = _unique(e["path"] for e in window if e.get("action") == "opened")
@@ -556,14 +568,15 @@ def _flush_plan(state: Path, now: float) -> dict[str, Any] | None:
     }
 
 
-def flush_session_feedback(root: Path) -> None:
+def flush_session_feedback(root: Path, lock_wait: float = SESSION_LOCK_WAIT) -> None:
     """Turn each closed window with file events into one record.
 
     Runs after a command that may have closed a window, and when a
     session starts. It takes the operation lock feedback uses, so no
     index lock may be held by this process. A busy lock means the flush
-    does nothing and the windows wait for the next one. Does nothing
-    without an index. Never raises.
+    does nothing and the windows wait for the next one. ``lock_wait``
+    bounds how long it waits for the lock. Does nothing without an
+    index. Never raises.
     """
     try:
         if not session_feedback_enabled():
@@ -580,7 +593,7 @@ def flush_session_feedback(root: Path) -> None:
 
         # Only try the lock: when a refresh holds it, the windows stay
         # for the next flush and this command has already printed.
-        with active_index_pointer(root, exclusive=True, lock_timeout=SESSION_LOCK_WAIT) as ptr:
+        with active_index_pointer(root, exclusive=True, lock_timeout=lock_wait) as ptr:
             if not ptr:
                 return
             plan = _flush_plan(state, time.time())
