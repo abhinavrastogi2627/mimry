@@ -347,13 +347,23 @@ def path_text(path: dict[str, Any]) -> str:
     return text
 
 
-def history_payload(con: sqlite3.Connection, root: Path, query: str, limit: int) -> dict[str, Any]:
+def history_payload(
+    con: sqlite3.Connection, root: Path, query: str, limit: int, *, read_only: bool = False
+) -> dict[str, Any]:
     """What `mimry history --json` prints and mimry_history returns.
 
     A repository without usable history gets an error object instead.
     The caller holds the index lock, since update_history writes.
     """
-    synced = update_history(con, root)
+    if read_only:
+        row = con.execute("select shallow, unavailable from history_state where id = 1").fetchone()
+        synced = {
+            "status": "unavailable" if row is None or row[1] else "current",
+            "reason": row[1] if row else "No commit history is stored in this read-only cache",
+            "shallow": bool(row[0]) if row else False,
+        }
+    else:
+        synced = update_history(con, root)
     if synced["status"] in ("unavailable", "error"):
         code = "no_history" if synced["status"] == "unavailable" else "history_failed"
         return {"returncode": 1, "error": {"code": code, "message": synced["reason"]}}

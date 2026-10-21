@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import sys
 import time
 import webbrowser
@@ -20,6 +21,7 @@ from .cache_safety import (
     UnsafeCachePathError,
     cache_writable,
     cache_write_denied,
+    refresh_hint,
     validated_cache_home,
     validated_current_root_cache_path,
 )
@@ -737,7 +739,7 @@ def _print_semantic_degrade(idx: Path, root_id: str | None) -> bool:
     if semantic_info["status"] == "current":
         return True
     ui.warn(f"Semantic search is {semantic_info['status']}")
-    ui.detail("Run `mimry refresh` to rebuild it.")
+    ui.detail(refresh_hint("Run `mimry refresh` to rebuild it."))
     return False
 
 
@@ -968,13 +970,20 @@ def cmd_history(a):
         ui.fail("Give a limit of 1 or more", 'For example: mimry history "login" --limit 5')
         return 2
     query = sanitize_query(a.query)
-    # Exclusive: the commit tables are written in place when HEAD moved.
-    with active_index_pointer(root, exclusive=True) as ptr:
+    read_only = getattr(a, "cache_read_only", False) or not cache_writable()
+    # A writable cache updates commit tables; a read-only one answers
+    # from stored history.
+    with active_index_pointer(root, exclusive=not read_only) as ptr:
         if not ptr:
             raise SystemExit(not_set_up(root))
-        con = connect(Path(ptr["indexPath"]))
+        idx = Path(ptr["indexPath"])
+        con = (
+            sqlite3.connect((idx / "mimry.sqlite").as_uri() + "?mode=ro", uri=True)
+            if read_only
+            else connect(idx)
+        )
         try:
-            payload = history_payload(con, root, query, a.limit)
+            payload = history_payload(con, root, query, a.limit, read_only=read_only)
         finally:
             con.close()
     if "error" in payload:
@@ -1040,7 +1049,7 @@ def _print_calls(a, relation: str) -> int:
         return 1 if "error" in payload else 0
     if "error" in payload and payload["error"]["code"] == "graph_not_current":
         ui.warn(payload["error"]["message"])
-        ui.detail("Run `mimry refresh`, then try again.")
+        ui.detail(refresh_hint("Run `mimry refresh`, then try again."))
         return 1
     target = payload["target"]
     if target is None:
@@ -1329,7 +1338,7 @@ def cmd_report(a):
 
     if graph["status"] != "current":
         ui.warn(f"The graph files are {graph['status']}, so the report may be out of date")
-        ui.detail("Run `mimry refresh` to rebuild the graph.")
+        ui.detail(refresh_hint("Run `mimry refresh` to rebuild the graph."))
 
     report_file = report_path(root)
     if report_file.exists():
@@ -1337,7 +1346,7 @@ def cmd_report(a):
         return 0
 
     ui.warn("GRAPH_REPORT.md not found")
-    ui.detail("Run `mimry refresh` to build the graph and report.")
+    ui.detail(refresh_hint("Run `mimry refresh` to build the graph and report."))
     return 2
 
 
@@ -1414,13 +1423,13 @@ def cmd_export(a):
 
     if graph["status"] != "current":
         ui.warn(f"The graph files are {graph['status']}, so export cannot proceed")
-        ui.detail("Run `mimry refresh`, then try again.")
+        ui.detail(refresh_hint("Run `mimry refresh`, then try again."))
         return 1
 
     # Load the full graph
     graph_data = load_graph(root)
     if not graph_data.get("nodes"):
-        ui.warn("No graph data found. Run `mimry refresh` to build the graph.")
+        ui.warn(refresh_hint("No graph data found. Run `mimry refresh` to build the graph."))
         return 1
 
     # Determine output path

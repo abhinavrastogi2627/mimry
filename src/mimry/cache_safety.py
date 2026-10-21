@@ -37,16 +37,33 @@ def cache_writable() -> bool:
     """Whether MIMRY's cache accepts a write, probed with a temp file.
 
     Only a write the OS refuses as denied counts as read-only. Any other
-    failure keeps the usual behaviour. Call it only for a stale index.
+    failure keeps the usual behaviour. Missing folders are not created.
     """
-    probe = cache_home().expanduser() / f".write-probe-{os.getpid()}"
-    try:
-        with probe.open("x"):
-            pass
-        probe.unlink()
-    except OSError as exc:
-        return not cache_write_denied(exc)
+    cache = cache_home().expanduser()
+    for folder in (cache, cache / "indexes"):
+        if not folder.is_dir():
+            continue
+        probe = folder / f".write-probe-{os.getpid()}"
+        created = False
+        try:
+            with probe.open("x"):
+                created = True
+        except OSError as exc:
+            if cache_write_denied(exc):
+                return False
+        finally:
+            if created:
+                probe.unlink(missing_ok=True)
     return True
+
+
+def refresh_hint(message: str, *, read_only: bool = False) -> str:
+    if read_only or not cache_writable():
+        return (
+            "The cache is read-only and cannot be refreshed. Set MIMRY_CACHE_HOME "
+            "to a writable folder, then try again."
+        )
+    return message
 
 
 class IndexOutsideCacheError(UnsafeCachePathError):
