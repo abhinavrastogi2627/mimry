@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,6 +19,7 @@ from mimry.core.artifacts import graph_path
 from mimry.feedback import list_feedback
 from mimry.hook import (
     PROMPT_NOTE_LIMIT,
+    PROMPT_QUERY_CHARS,
     _prompt_note,
     cmd_hook_check,
     cmd_hook_prompt,
@@ -125,6 +127,58 @@ def test_an_identifier_alone_names_the_task(repo, monkeypatch, capsys):
     note = _note(_prompt(monkeypatch, capsys, repo, "what does create_session return to callers"))
 
     assert "session.py" in note
+
+
+@pytest.mark.parametrize(
+    "unit, count",
+    [("a.", 50_000), ("a/", 50_000), ("a-", 50_000), ("a", 200_000)],
+    ids=["dot-run", "slash-run", "dash-run", "single-word"],
+)
+def test_a_long_unbroken_token_keeps_the_prompt_hook_fast(repo, monkeypatch, capsys, unit, count):
+    prompt = "please fix the code in " + unit * count + " fix it"
+
+    started = time.perf_counter()
+    out = _prompt(monkeypatch, capsys, repo, prompt)
+
+    # Quadratic took minutes here; the bound leaves room for slow CI.
+    assert time.perf_counter() - started < 2.0
+    assert out == ""
+
+
+def test_a_file_named_after_a_long_filler_is_still_found(repo, monkeypatch, capsys):
+    # The whole prompt is read for code names, so a file named after a
+    # long paste gets its note and leads the query the note searches.
+    filler = "lorem ipsum dolor sit amet " * (PROMPT_QUERY_CHARS // 27 + 1)
+    before = _query_count(repo)
+
+    note = _note(_prompt(monkeypatch, capsys, repo, filler + "please check src/auth/session.py"))
+
+    assert "session.py" in note
+    assert _query_count(repo) == before + 1
+    assert _query_rows(repo)[-1]["query"].startswith("src/auth/session.py")
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "a." * 500_000,
+        "a/" * 500_000,
+        "a-" * 500_000,
+        "a" * 1_000_000,
+        "x.py" * 250_000,
+        "```" + "a." * 500_000,
+        "http://" * 142_857,
+    ],
+    ids=["dot-run", "slash-run", "dash-run", "one-word", "file-run", "unclosed-fence", "url-run"],
+)
+def test_a_megabyte_prompt_is_decided_quickly(repo, monkeypatch, capsys, shape):
+    prompt = "please fix the code in " + shape + " fix it"
+
+    started = time.perf_counter()
+    _prompt(monkeypatch, capsys, repo, prompt)
+
+    # Each shape takes about 50 ms; the bound leaves room for slow CI.
+    assert time.perf_counter() - started < 0.5
 
 
 def test_prompt_hook_prints_nothing_when_switched_off(repo, monkeypatch, capsys):
