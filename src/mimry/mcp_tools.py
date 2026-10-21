@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import io
 import sys
 from functools import wraps
@@ -12,7 +13,11 @@ from types import SimpleNamespace
 from typing import Any, Literal
 
 from mimry.adapters import list_adapters
-from mimry.cache_safety import IndexOutsideCacheError, UnsafeCachePathError
+from mimry.cache_safety import (
+    READ_ONLY_CACHE_STALE_WARNING,
+    IndexOutsideCacheError,
+    UnsafeCachePathError,
+)
 from mimry.core.artifacts import CALL_DIRECTIONS, graph_health
 from mimry.core.languages import language_counts
 from mimry.digest import canonical_digest
@@ -22,6 +27,7 @@ from mimry.history import history_payload
 from mimry.indexer import write_index
 from mimry.lifecycle import (
     INDEX_REBUILT_NOTE,
+    answers_from_read_only_cache,
     build_graph_first,
     change_summary,
     rebuild_outdated_index,
@@ -326,6 +332,12 @@ def _requires_text(param: str, noun: str, example: str):
     return decorate
 
 
+# Whether the running tool's refresh was refused by a read-only cache.
+_CACHE_READ_ONLY: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "mimry_cache_read_only", default=False
+)
+
+
 def _index_operation(*, exclusive: bool = False, refresh: bool = False):
     def decorate(func):
         func_signature = signature(func)
@@ -336,14 +348,31 @@ def _index_operation(*, exclusive: bool = False, refresh: bool = False):
             root_path = _root(bound.arguments.get("root"))
             stats = None
             graph_error = None
+            read_only = False
             if refresh:
-                stats = refresh_if_stale(root_path, include_missing=True)
                 try:
-                    build_graph_first(root_path)
-                except Exception as exc:  # the payload's graph health still reports what is left
-                    graph_error = str(exc)
-            with active_index_pointer(root_path, exclusive=exclusive):
-                result = func(*args, **kwargs)
+                    stats = refresh_if_stale(root_path, include_missing=True)
+                except PermissionError as exc:
+                    # A read-only cache still answers from its index.
+                    if not answers_from_read_only_cache(root_path, exc):
+                        raise
+                    read_only = True
+                else:
+                    try:
+                        build_graph_first(root_path)
+                    except Exception as exc:
+                        # Graph health still shows what is left.
+                        graph_error = str(exc)
+            token = _CACHE_READ_ONLY.set(read_only)
+            try:
+                with active_index_pointer(root_path, exclusive=exclusive):
+                    result = func(*args, **kwargs)
+            finally:
+                _CACHE_READ_ONLY.reset(token)
+            if read_only and isinstance(result, dict):
+                # Same key and wording as the preflight's warning.
+                before = result.get("stdout") or ""
+                result["stdout"] = "\n".join(filter(None, (READ_ONLY_CACHE_STALE_WARNING, before)))
             if stats is not None and isinstance(result, dict):
                 if stats.get("set_up_worktree"):
                     result["set_up_worktree"] = True
@@ -740,7 +769,9 @@ def mimry_context(query: str, root: str | None = None, semantic: bool = False) -
     raw_query = query
     query = sanitize_query(query)
     ptr = require(root_path)
-    rows, pack_path = write_context_pack(root_path, ptr, raw_query, semantic=semantic)
+    rows, pack_path = write_context_pack(
+        root_path, ptr, raw_query, semantic=semantic, read_only=_CACHE_READ_ONLY.get()
+    )
     return sanitize_data(
         {
             "query": redact_sensitive_text(query),
