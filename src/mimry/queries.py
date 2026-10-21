@@ -12,7 +12,12 @@ from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
 from . import ui
-from .cache_safety import READ_ONLY_CACHE_STALE_WARNING, IndexOutsideCacheError, cache_write_denied
+from .cache_safety import (
+    READ_ONLY_CACHE_STALE_WARNING,
+    IndexOutsideCacheError,
+    cache_write_denied,
+    refresh_hint,
+)
 from .constants import NON_CODE_KINDS
 from .core.artifacts import (
     INFERRED_NOTE,
@@ -116,7 +121,12 @@ def _print_index_note(fresh: dict, graph: dict, *, read_only: bool = False) -> N
         if not read_only:
             ui.warn(_stale_index_message(fresh))
     elif graph["status"] != "current":
-        ui.warn(f"Graph files are {graph['status']}. Run `mimry refresh` to rebuild them.")
+        ui.warn(
+            refresh_hint(
+                f"Graph files are {graph['status']}. Run `mimry refresh` to rebuild them.",
+                read_only=read_only,
+            )
+        )
 
 
 def _refresh_action(fresh: dict, graph: dict, *, read_only: bool = False) -> str:
@@ -1124,7 +1134,7 @@ def run_path(a, found: list | None = None):
             )
             return 1
         ui.warn(message)
-        ui.detail("Run `mimry refresh`, then try again.")
+        ui.detail(refresh_hint("Run `mimry refresh`, then try again."))
         return 1
     result = shortest_path(root, source, target)
     if found is not None:
@@ -1729,7 +1739,7 @@ def _print_impact(payload: dict) -> None:
     error = payload.get("error")
     if error and error["code"] == "graph_not_current":
         ui.warn(error["message"])
-        ui.detail("Run `mimry refresh`, then try again.")
+        ui.detail(refresh_hint("Run `mimry refresh`, then try again."))
         return
     if error and error["code"] == "no_git":
         ui.warn(error["message"])
@@ -1968,7 +1978,11 @@ def _print_why(answer: dict, verbose: bool) -> None:
         # A failed lookup stops here: no evidence or verify block.
         return
     if graph["status"] != "current":
-        ui.warn(f"The graph files are {graph['status']}. Run `mimry refresh` for graph evidence.")
+        ui.warn(
+            refresh_hint(
+                f"The graph files are {graph['status']}. Run `mimry refresh` for graph evidence."
+            )
+        )
     elif answer["evidence"]["node_count"]:
         evidence = answer["evidence"]
         surface = answer["surface"]

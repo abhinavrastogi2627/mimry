@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import io
+import sqlite3
 import sys
 from functools import wraps
 from inspect import signature
@@ -14,9 +15,12 @@ from typing import Any, Literal
 
 from mimry.adapters import list_adapters
 from mimry.cache_safety import (
+    CACHE_NOT_WRITABLE_HINT,
     READ_ONLY_CACHE_STALE_WARNING,
     IndexOutsideCacheError,
     UnsafeCachePathError,
+    cache_writable,
+    cache_write_denied,
 )
 from mimry.core.artifacts import CALL_DIRECTIONS, graph_health
 from mimry.core.languages import language_counts
@@ -200,6 +204,17 @@ def _state_guard(func):
             return sanitize_data(
                 _state_error_payload(exc, root=_root(root) if isinstance(root, str) else None)
             )
+        except PermissionError as exc:
+            if not cache_write_denied(exc):
+                raise
+            return {
+                "returncode": 2,
+                "error": {
+                    "code": "cache_read_only",
+                    "message": "MIMRY cannot write its read-only cache.",
+                },
+                "recommended": CACHE_NOT_WRITABLE_HINT,
+            }
         except StateLockTimeoutError as exc:
             return sanitize_data(
                 {
@@ -363,9 +378,11 @@ def _index_operation(*, exclusive: bool = False, refresh: bool = False):
                     except Exception as exc:
                         # Graph health still shows what is left.
                         graph_error = str(exc)
+            if exclusive and refresh and not cache_writable():
+                read_only = True
             token = _CACHE_READ_ONLY.set(read_only)
             try:
-                with active_index_pointer(root_path, exclusive=exclusive):
+                with active_index_pointer(root_path, exclusive=exclusive and not read_only):
                     result = func(*args, **kwargs)
             finally:
                 _CACHE_READ_ONLY.reset(token)
@@ -422,6 +439,16 @@ def _status_payload_unchecked(root_path: Path, verify: bool = False) -> dict[str
         "graph": graph,
         "semantic": semantic_health(Path(idx), ptr.get("rootId"), expected_files=len(files)),
     }
+    if not cache_writable():
+        payload["cache_read_only"] = True
+        payload["stdout"] = (
+            READ_ONLY_CACHE_STALE_WARNING
+            if state == "stale"
+            else (
+                "The cache is read-only; the existing index can still answer. "
+                + CACHE_NOT_WRITABLE_HINT
+            )
+        )
     return payload
 
 
@@ -882,9 +909,17 @@ def mimry_history(query: str, limit: int = 10, root: str | None = None) -> dict[
         }
     root_path = _root(root)
     ptr = require(root_path)
-    con = connect(Path(ptr["indexPath"]))
+    read_only = _CACHE_READ_ONLY.get()
+    idx = Path(ptr["indexPath"])
+    con = (
+        sqlite3.connect((idx / "mimry.sqlite").as_uri() + "?mode=ro", uri=True)
+        if read_only
+        else connect(idx)
+    )
     try:
-        payload = history_payload(con, root_path, sanitize_query(query), limit)
+        payload = history_payload(
+            con, root_path, sanitize_query(query), limit, read_only=read_only
+        )
     finally:
         con.close()
     return sanitize_data(payload)
