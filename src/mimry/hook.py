@@ -180,6 +180,34 @@ MCP_QUERY_RE = re.compile(MCP_QUERY_NAME)
 MIMRY_QUERY_COMMANDS = frozenset(
     {"find", "preflight", "context", "related", "route", "explain", "brief", "history", "semantic"}
 )
+# Every mimry subcommand, and the top-level options that take a value.
+# Written out because building the CLI parser in the hook costs half a
+# second; a test keeps them equal to the parser's.
+MIMRY_SUBCOMMANDS = frozenset(
+    """adapters bench brief cache callees callers context digest doctor embed
+    explain export feedback find git-hooks history hook-check hook-compact
+    hook-prompt hook-refresh hook-stop impact index init install mcp path plan
+    preflight refresh reindex related report roots route semantic stats status
+    symbol uninstall update upgrade watch why""".split()
+)
+MIMRY_VALUED_OPTIONS = frozenset({"--root"})
+
+
+def _starts_command(words: list[str], i: int) -> bool:
+    """Whether the mimry word at ``i`` starts a command: the first word
+    after it that is not an option is a mimry subcommand.
+
+    Scans stop at the first such word, so each word is read once.
+    """
+    j = i + 1
+    while j < len(words):
+        if words[j] in MIMRY_VALUED_OPTIONS:
+            j += 2  # the option's value
+        elif words[j].startswith("-"):
+            j += 1
+        else:
+            return words[j] in MIMRY_SUBCOMMANDS
+    return False
 
 
 class _Search(NamedTuple):
@@ -432,9 +460,11 @@ def mimry_queries(command: str) -> list[str]:
 
     Every word after a query command, up to the next mimry word, except
     options, is a candidate: a quoted query is one word, and an option's
-    value only matters when it equals a query exactly. Each word is
-    visited once, so the cost is linear. Returns [] when the command
-    does not parse or runs no query command.
+    value only matters when it equals a query exactly. A mimry word
+    starts a command only when a subcommand follows its options, else it
+    is a query word. Each word is visited a bounded number of times, so
+    the cost is linear. Returns [] when the command does not parse or
+    runs no query command.
     """
     queries: list[str] = []
     for words, _ in _shell_segments(command):
@@ -444,6 +474,7 @@ def mimry_queries(command: str) -> list[str]:
             if re.split(r"[\\/]", word)[-1].lower().removesuffix(".exe") == "mimry"
             # ``mimry find mimry`` searches for the word.
             and not (i and words[i - 1] in MIMRY_QUERY_COMMANDS)
+            and _starts_command(words, i)
         ]
         for n, i in enumerate(starts):
             end = starts[n + 1] if n + 1 < len(starts) else len(words)
