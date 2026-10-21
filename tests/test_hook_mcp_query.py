@@ -19,8 +19,8 @@ from test_mimry_cli import copy_fixture, run_cli
 
 from mimry import installer
 from mimry.constants import MCP_QUERY_NAME
-from mimry.hook import cmd_hook_check
-from mimry.session import HOOK_COMMAND_LOG, record_query
+from mimry.hook import cmd_hook_check, mimry_queries
+from mimry.session import HOOK_COMMAND_LOG, _query_hash, record_query
 
 SESSION = "mcp-session-under-test"
 QUERY = "login session timeout"
@@ -79,7 +79,8 @@ def test_mcp_find_is_logged_with_its_session_and_prints_nothing(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == ""
-    assert [row["command"] for row in _command_rows(repo)] == [QUERY]
+    assert [row["queries"] for row in _command_rows(repo)] == [[_query_hash(QUERY)]]
+    assert "command" not in _command_rows(repo)[0]
     assert _command_rows(repo)[0]["session"] == SESSION
 
     # The find the MCP tool then runs records the same text, tagged.
@@ -157,3 +158,38 @@ def test_pre_tool_use_matcher_leaves_out_other_tools():
 def test_mcp_query_name_is_the_one_the_matcher_uses():
     assert MATCHER == f"^(?:Bash|Glob|Grep|Read|{MCP_QUERY_NAME})$"
     assert installer.hook_table("codex")["PreToolUse"] == [("Bash", "hook-check", False)]
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ('mimry find "login session timeout"', ["login session timeout"]),
+        ('cd repo && uv run mimry preflight "fix login" --json', ["fix login"]),
+        ("C:\\Tools\\mimry.exe context fetch_user", ["fetch_user"]),
+        ('mimry find "a" | head', ["a"]),
+        ("mimry feedback --query fetch_user", []),
+        ("cat fetch_user.txt", []),
+    ],
+)
+def test_mimry_queries_reads_the_query_argument_of_each_mimry_command(command, expected):
+    assert mimry_queries(command) == expected
+
+
+def test_the_commands_log_keeps_no_query_text(tmp_path, monkeypatch):
+    repo = _repo(tmp_path, monkeypatch)
+    secret_query = "apply_feedback password=tomato-canary"
+    _hook(
+        monkeypatch,
+        repo,
+        {
+            "session_id": SESSION,
+            "tool_name": "Bash",
+            "tool_input": {"command": f'mimry find "{secret_query}"'},
+        },
+    )
+
+    text = (repo / ".mimry" / HOOK_COMMAND_LOG).read_text(encoding="utf-8")
+    assert "tomato-canary" not in text
+    assert "mimry find" not in text
+    record_query(repo, secret_query, [])
+    assert _query_rows(repo)[-1]["session"] == SESSION
