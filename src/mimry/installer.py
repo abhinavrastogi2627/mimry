@@ -2268,7 +2268,7 @@ def record_global_ignore_opt_out(root: Path) -> None:
     else:
         newline = "\r\n" if "\r\n" in existing else "\n"
         preamble = "no_global_gitignore = true" + newline + preamble
-    _atomic_write(config, preamble + tables)
+    _atomic_write(config, preamble + tables, newline="")
 
 
 def _global_ignore_path(*, warn: bool = True) -> Path | None:

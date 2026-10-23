@@ -225,6 +225,7 @@ def test_atomic_write_does_not_translate_newlines_on_windows(home, monkeypatch):
     def windows_write(path, data, *args, **kwargs):
         if kwargs.get("newline") is None:
             data = data.replace("\n", "\r\n")
+        kwargs["newline"] = ""
         return original(path, data, *args, **kwargs)
 
     monkeypatch.setattr(Path, "write_text", windows_write)
@@ -239,7 +240,8 @@ def test_atomic_write_preserves_crlf_for_always_on_files_on_windows(tmp_path, mo
 
     def windows_write(path, data, *args, **kwargs):
         if kwargs.get("newline") is None:
-            data = data.replace("\r\n", "\n").replace("\n", "\r\n")
+            data = data.replace("\n", "\r\n")
+        kwargs["newline"] = ""
         return original(path, data, *args, **kwargs)
 
     monkeypatch.setattr(Path, "write_text", windows_write)
@@ -247,7 +249,7 @@ def test_atomic_write_preserves_crlf_for_always_on_files_on_windows(tmp_path, mo
     existing = "# Team rules\r\nKeep the existing line endings.\r\n"
     agents.write_bytes(existing.encode())
 
-    installer._atomic_write(agents, existing + "## MIMRY\r\n")
+    installer._atomic_write(agents, agents.read_text(encoding="utf-8") + "## MIMRY\n")
 
     assert agents.read_bytes() == (existing + "## MIMRY\r\n").encode()
 
@@ -268,8 +270,21 @@ def test_init_opt_out_survives_doctor_reinit_and_refresh(home, tmp_path, monkeyp
 @pytest.mark.parametrize(
     "key", ["no_global_gitignore", '"no_global_gitignore"', "'no_global_gitignore'"]
 )
-def test_recording_opt_out_preserves_comments_tables_and_line_endings(home, tmp_path, key):
+def test_recording_opt_out_preserves_comments_tables_and_line_endings(
+    home, tmp_path, key, monkeypatch
+):
     import tomllib
+    from pathlib import Path
+
+    original_write = Path.write_text
+
+    def windows_write(path, data, *args, **kwargs):
+        if kwargs.get("newline") is None:
+            data = data.replace("\n", "\r\n")
+        kwargs["newline"] = ""
+        return original_write(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", windows_write)
 
     root = tmp_path / "repo"
     config = root / ".mimry" / "config.toml"
