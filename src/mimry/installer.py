@@ -907,11 +907,11 @@ Rules:
 """  # noqa: E501 - Markdown written verbatim; its line breaks are content
 
 
-def _atomic_write(path: Path, content: str) -> None:
+def _atomic_write(path: Path, content: str, *, newline: str | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     try:
-        tmp.write_text(content, encoding="utf-8", newline="")
+        tmp.write_text(content, encoding="utf-8", newline=newline)
         replace_path(tmp, path)
     except OSError:
         with contextlib.suppress(OSError):
@@ -2326,7 +2326,9 @@ def _add_global_ignore(*, dry_run: bool) -> None:
     lead = "" if not existing or existing.endswith("\n") else newline
     try:
         _atomic_write(
-            path, existing + lead + newline.join([_GLOBAL_IGNORE_MARKER, *missing]) + newline
+            path,
+            existing + lead + newline.join([_GLOBAL_IGNORE_MARKER, *missing]) + newline,
+            newline="",
         )
     except OSError as exc:
         ui.warn(f"Could not write {shown}: {exc.strerror or exc}")

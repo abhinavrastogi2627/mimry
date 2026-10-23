@@ -159,10 +159,10 @@ def test_unreadable_file_warns_and_install_still_succeeds(home, capsys):
 def test_write_failure_warns_with_the_lines_to_add_by_hand(home, monkeypatch, capsys):
     real_atomic_write = installer._atomic_write
 
-    def refuse_the_ignore_file(path, content):
+    def refuse_the_ignore_file(path, content, **kwargs):
         if path.name == "ignore":
             raise PermissionError(13, "Permission denied")
-        real_atomic_write(path, content)
+        real_atomic_write(path, content, **kwargs)
 
     monkeypatch.setattr(installer, "_atomic_write", refuse_the_ignore_file)
 
@@ -230,6 +230,26 @@ def test_atomic_write_does_not_translate_newlines_on_windows(home, monkeypatch):
     monkeypatch.setattr(Path, "write_text", windows_write)
     _install()
     assert _default_file(home).read_bytes() == GLOBAL_LINES.encode("utf-8")
+
+
+def test_atomic_write_preserves_crlf_for_always_on_files_on_windows(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    original = Path.write_text
+
+    def windows_write(path, data, *args, **kwargs):
+        if kwargs.get("newline") is None:
+            data = data.replace("\r\n", "\n").replace("\n", "\r\n")
+        return original(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", windows_write)
+    agents = tmp_path / "AGENTS.md"
+    existing = "# Team rules\r\nKeep the existing line endings.\r\n"
+    agents.write_bytes(existing.encode())
+
+    installer._atomic_write(agents, existing + "## MIMRY\r\n")
+
+    assert agents.read_bytes() == (existing + "## MIMRY\r\n").encode()
 
 
 def test_init_opt_out_survives_doctor_reinit_and_refresh(home, tmp_path, monkeypatch):
