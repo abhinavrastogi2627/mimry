@@ -385,6 +385,20 @@ def test_deleted_generation_is_missing_and_cli_can_rebuild(tmp_path, monkeypatch
     assert index_freshness(repo, load_pointer(repo))["state"] == "current"
 
 
+def test_symbol_rebuilds_a_deleted_generation_before_reporting_matches(tmp_path, monkeypatch):
+    repo, cache = _initialized_repo(tmp_path)
+    monkeypatch.setenv("MIMRY_CACHE_HOME", str(cache))
+    shutil.rmtree(Path(load_pointer(repo)["indexPath"]))
+
+    result = run_cli(repo, cache, "symbol", "auth")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "auth" in result.stdout.lower()
+    status = run_cli(repo, cache, "status")
+    assert status.returncode == 0, status.stdout + status.stderr
+    assert "not indexed" not in status.stdout.lower()
+
+
 def test_mcp_rebuilds_a_deleted_generation(tmp_path, monkeypatch):
     repo, cache = _initialized_repo(tmp_path)
     monkeypatch.setenv("MIMRY_CACHE_HOME", str(cache))
