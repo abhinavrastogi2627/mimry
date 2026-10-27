@@ -309,6 +309,19 @@ def test_recording_opt_out_preserves_comments_tables_and_line_endings(
     assert _default_file(home).read_bytes() == GLOBAL_LINES.encode()
 
 
+def test_recording_opt_out_keeps_an_invalid_config_unchanged(home, tmp_path, capsys):
+    root = tmp_path / "repo"
+    config = root / ".mimry" / "config.toml"
+    config.parent.mkdir(parents=True)
+    original = b'version = "0.1.0\n'
+    config.write_bytes(original)
+
+    installer.record_global_ignore_opt_out(root)
+
+    assert config.read_bytes() == original
+    assert "Could not save the global Git ignore choice" in capsys.readouterr().out
+
+
 def test_environment_opt_out_is_not_recorded_by_init(home, tmp_path, monkeypatch):
     import tomllib
 

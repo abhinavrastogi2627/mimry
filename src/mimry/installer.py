@@ -2251,7 +2251,11 @@ def record_global_ignore_opt_out(root: Path) -> None:
     """Record an init choice without replacing other root settings."""
     config = root / ".mimry" / "config.toml"
     existing = config.read_bytes().decode("utf-8") if config.exists() else ""
-    data = tomllib.loads(existing)
+    try:
+        data = tomllib.loads(existing)
+    except tomllib.TOMLDecodeError:
+        ui.warn("Could not save the global Git ignore choice: .mimry/config.toml is invalid TOML")
+        return
     if data.get("no_global_gitignore") is True:
         return
     # Only the top-level key controls this setting.
