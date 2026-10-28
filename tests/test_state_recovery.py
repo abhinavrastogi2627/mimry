@@ -386,14 +386,34 @@ def test_deleted_generation_is_missing_and_cli_can_rebuild(tmp_path, monkeypatch
 
 
 def test_symbol_rebuilds_a_deleted_generation_before_reporting_matches(tmp_path, monkeypatch):
-    repo, cache = _initialized_repo(tmp_path)
+    repo = copy_fixture(tmp_path)
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Mimry test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "fixture",
+        ],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    cache = tmp_path / "cache"
+    assert run_cli(repo, cache, "init", "--skip-graph").returncode == 0
+    assert run_cli(repo, cache, "index", "--full").returncode == 0
     monkeypatch.setenv("MIMRY_CACHE_HOME", str(cache))
     shutil.rmtree(Path(load_pointer(repo)["indexPath"]))
 
     result = run_cli(repo, cache, "symbol", "auth")
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "auth" in result.stdout.lower()
+    assert "src/auth/middleware.py" in result.stdout
     status = run_cli(repo, cache, "status")
     assert status.returncode == 0, status.stdout + status.stderr
     assert "not indexed" not in status.stdout.lower()
