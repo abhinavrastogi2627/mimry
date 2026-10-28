@@ -21,7 +21,7 @@ from .indexer import write_index
 from .install_info import repair_command
 from .installer import _LEGACY_BLOCK_PATTERNS, add_global_ignore
 from .paths import graph_output_dir, idx_path, mdir, now, output_dir, pointer_file
-from .scanner import _git_output, is_linked_worktree, size_limit_text
+from .scanner import _git_output, is_linked_worktree, size_limit_text, worktree_fingerprint
 from .security import safe_root
 from .semantic import semantic_health
 from .state import atomic_write_text
@@ -333,6 +333,13 @@ def refresh_if_stale(root: Path, *, include_missing: bool = False) -> dict | Non
     """
     with active_index_pointer(root) as active:
         if active is not None:
+            recorded = active.get("worktreeFingerprint")
+            if (
+                recorded
+                and recorded == worktree_fingerprint(root)
+                and (Path(active["indexPath"]) / "generation.json").is_file()
+            ):
+                return None  # git sees the same tree that was indexed
             states = ("stale", "missing") if include_missing else ("stale",)
             if index_freshness(root, active)["state"] not in states:
                 return None
